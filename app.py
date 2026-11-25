@@ -1,17 +1,17 @@
-"""ReFind AI — Intelligent AI-Powered Lost & Found Management System.
+"""ReFind AI — Intelligent AI-Powered Lost & Found Management System (v1.1).
 
 Streamlit web application providing:
-- Campus Dashboard with live KPIs, recent reports, and top AI match highlights
-- AI Matching Dashboard powered by sentence-transformers/all-MiniLM-L6-v2
-- Report Lost Item & Report Found Item forms with immediate AI match feedback
-- Browse & Manage Reports with search, multi-filter, and recovery status actions
+- Responsive Campus Dashboard with live KPIs, recent reports, and top AI match highlights
+- Academic-grade AI Matching Dashboard powered by sentence-transformers/all-MiniLM-L6-v2
+- Reliable Report Lost Item & Report Found Item forms with duplicate guard & instant AI matching
+- Browse & Manage Reports with search, multi-filter, and persistent recovery management
 """
 
 from __future__ import annotations
 
 import html
-from datetime import date
-from pathlib import Path
+import sqlite3
+from datetime import date, timedelta
 from typing import Any, Optional
 
 import streamlit as st
@@ -27,6 +27,7 @@ from ai_matcher import (
 from database import (
     delete_report,
     delete_seed_reports,
+    find_duplicate_report,
     get_all_reports,
     get_dashboard_stats,
     get_report_by_id,
@@ -51,6 +52,13 @@ PAGES = [
     "Report Lost Item",
     "Report Found Item",
     "Browse Reports",
+]
+
+DEMO_PRESETS: list[tuple[str, str]] = [
+    ("Wallet Near Library", "seed_lost_wallet_library"),
+    ("Water Bottle (Paraphrase)", "seed_lost_blue_water_bottle"),
+    ("Casio Calculator", "seed_lost_scientific_calculator"),
+    ("Red vs. Blue Bag", "seed_lost_red_backpack"),
 ]
 
 
@@ -108,21 +116,24 @@ def render_page_header(title: str, subtitle: str) -> None:
 
 
 def render_report_card_html(report: dict[str, Any], compact: bool = False) -> str:
-    """Build clean HTML markup for a lost or found report card."""
-    rtype = report["report_type"].lower()
-    status = report["status"].lower()
+    """Build clean, responsive HTML markup for a lost or found report card."""
+    rtype = str(report["report_type"]).lower()
+    status = str(report["status"]).lower()
     type_cls = "badge-lost" if rtype == "lost" else "badge-found"
     status_cls = "badge-recovered" if status == "recovered" else "badge-active"
+    card_cls = "card-recovered" if status == "recovered" else (
+        "card-lost" if rtype == "lost" else "card-found"
+    )
 
-    desc = report["description"]
-    if compact and len(desc) > 150:
-        desc = desc[:147].rstrip() + "..."
+    desc = str(report.get("description") or "")
+    if compact and len(desc) > 155:
+        desc = desc[:152].rstrip() + "..."
 
     extra_html = ""
     if not compact and report.get("additional_details"):
         extra_html = (
             f'<div class="rf-meta-row" style="margin-top:0.45rem;">'
-            f'<span class="rf-meta-item"><strong>Notes:</strong> {esc(report["additional_details"])}</span>'
+            f'<span class="rf-meta-item"><strong>Additional Notes:</strong> {esc(report["additional_details"])}</span>'
             f"</div>"
         )
 
@@ -133,14 +144,14 @@ def render_report_card_html(report: dict[str, Any], compact: bool = False) -> st
         )
 
     return f"""
-    <div class="rf-card">
+    <div class="rf-card {card_cls}">
         <div class="rf-card-header">
-            <div>
+            <div style="min-width:0; flex:1;">
                 <div class="rf-card-title">#{int(report["id"])} &middot; {esc(report["title"])}</div>
             </div>
             <div style="display:flex; gap:0.35rem; flex-wrap:wrap; justify-content:flex-end;">
-                <span class="rf-badge {type_cls}">{esc(rtype.upper())}</span>
-                <span class="rf-badge {status_cls}">{esc(status.upper())}</span>
+                <span class="rf-badge {type_cls}"><span class="rf-badge-dot"></span>{esc(rtype.upper())}</span>
+                <span class="rf-badge {status_cls}"><span class="rf-badge-dot"></span>{esc(status.upper())}</span>
             </div>
         </div>
         <p class="rf-card-desc">{esc(desc)}</p>
@@ -163,25 +174,38 @@ def render_match_result_card(
     key_prefix: str,
     allow_recovery_actions: bool = True,
 ) -> None:
-    """Render an Explainable AI match card with score breakdown and actions."""
+    """Render an Explainable AI match card with weighted contribution breakdown."""
     cand = result.candidate
     tier_label, tier_cls = score_tier(result.final_score)
-    card_accent = "tier-strong" if result.final_score >= 75.0 else ""
+    is_strong = result.final_score >= 75.0
+    card_accent = "tier-strong" if is_strong else ""
+    bar_accent = "strong" if is_strong else ""
 
-    rtype = cand["report_type"].lower()
+    rtype = str(cand["report_type"]).lower()
     type_cls = "badge-lost" if rtype == "lost" else "badge-found"
-    status = cand["status"].lower()
+    status = str(cand["status"]).lower()
     status_cls = "badge-recovered" if status == "recovered" else "badge-active"
+
+    top_pick_html = (
+        '<span class="rf-badge badge-top-pick">Top Candidate</span>'
+        if rank == 1 and result.final_score >= 60.0
+        else ""
+    )
 
     sem_pct = round(result.semantic_score * 100)
     cat_pct = round(result.category_score * 100)
     loc_pct = round(result.location_score * 100)
     date_pct = round(result.date_score * 100)
 
-    w_sem = round(config.weight_semantic * 100)
-    w_cat = round(config.weight_category * 100)
-    w_loc = round(config.weight_location * 100)
-    w_date = round(config.weight_date * 100)
+    max_sem = round(config.weight_semantic * 100.0, 1)
+    max_cat = round(config.weight_category * 100.0, 1)
+    max_loc = round(config.weight_location * 100.0, 1)
+    max_date = round(config.weight_date * 100.0, 1)
+
+    sem_pts = result.semantic_contribution
+    cat_pts = result.category_contribution
+    loc_pts = result.location_contribution
+    date_pts = result.date_contribution
 
     sem_bar_cls = "green" if sem_pct >= 70 else ""
     cat_bar_cls = "green" if cat_pct >= 100 else ""
@@ -191,16 +215,18 @@ def render_match_result_card(
     days_label = (
         "Same day"
         if result.days_apart == 0
-        else (f"{result.days_apart}d apart" if result.days_apart is not None else "N/A")
+        else (f"{result.days_apart}d apart" if result.days_apart is not None else "Date N/A")
     )
+    overall_pct = max(0.0, min(100.0, result.final_score))
 
     st.markdown(
         f"""
         <div class="match-card {card_accent}">
             <div class="rf-card-header">
-                <div>
-                    <div style="display:flex; align-items:center; gap:0.45rem; flex-wrap:wrap; margin-bottom:0.35rem;">
-                        <span class="rf-badge {type_cls}">{esc(rtype.upper())} #{int(cand["id"])}</span>
+                <div style="min-width:0; flex:1;">
+                    <div style="display:flex; align-items:center; gap:0.4rem; flex-wrap:wrap; margin-bottom:0.4rem;">
+                        {top_pick_html}
+                        <span class="rf-badge {type_cls}"><span class="rf-badge-dot"></span>{esc(rtype.upper())} #{int(cand["id"])}</span>
                         <span class="rf-badge {tier_cls}">Rank #{rank} &middot; {esc(tier_label)}</span>
                         <span class="rf-badge {status_cls}">{esc(status.upper())}</span>
                     </div>
@@ -209,6 +235,16 @@ def render_match_result_card(
                 <div class="match-score-box">
                     <div class="match-score-number">{result.final_score:.1f}<span style="font-size:0.95rem;color:#64748B;">/100</span></div>
                     <div class="match-score-sub">Similarity Score</div>
+                </div>
+            </div>
+
+            <div class="overall-bar-wrap">
+                <div class="overall-bar-meta">
+                    <span><strong>Weighted Similarity Index</strong> (Cosine: {result.raw_cosine_similarity:.3f})</span>
+                    <span>{sem_pts:.1f} + {cat_pts:.1f} + {loc_pts:.1f} + {date_pts:.1f} = <strong>{result.final_score:.1f} / 100</strong></span>
+                </div>
+                <div class="overall-bar-track">
+                    <div class="overall-bar-fill {bar_accent}" style="width:{overall_pct:.1f}%;"></div>
                 </div>
             </div>
 
@@ -223,19 +259,23 @@ def render_match_result_card(
 
             <div class="signal-grid">
                 <div class="signal-box">
-                    <div class="signal-label"><span>Semantic ({w_sem}%)</span><span>{sem_pct}%</span></div>
+                    <div class="signal-label"><span>Semantic Similarity</span><span>{sem_pct}%</span></div>
+                    <div class="signal-contrib">+{sem_pts:.1f} <span>/ {max_sem:.0f} pts</span></div>
                     <div class="signal-bar-track"><div class="signal-bar-fill {sem_bar_cls}" style="width:{sem_pct}%;"></div></div>
                 </div>
                 <div class="signal-box">
-                    <div class="signal-label"><span>Category ({w_cat}%)</span><span>{cat_pct}%</span></div>
+                    <div class="signal-label"><span>Category Match</span><span>{cat_pct}%</span></div>
+                    <div class="signal-contrib">+{cat_pts:.1f} <span>/ {max_cat:.0f} pts</span></div>
                     <div class="signal-bar-track"><div class="signal-bar-fill {cat_bar_cls}" style="width:{cat_pct}%;"></div></div>
                 </div>
                 <div class="signal-box">
-                    <div class="signal-label"><span>Location ({w_loc}%)</span><span>{loc_pct}%</span></div>
+                    <div class="signal-label"><span>Location Match</span><span>{loc_pct}%</span></div>
+                    <div class="signal-contrib">+{loc_pts:.1f} <span>/ {max_loc:.0f} pts</span></div>
                     <div class="signal-bar-track"><div class="signal-bar-fill {loc_bar_cls}" style="width:{loc_pct}%;"></div></div>
                 </div>
                 <div class="signal-box">
-                    <div class="signal-label"><span>Date ({w_date}%)</span><span>{date_pct}%</span></div>
+                    <div class="signal-label"><span>Date Proximity</span><span>{date_pct}%</span></div>
+                    <div class="signal-contrib">+{date_pts:.1f} <span>/ {max_date:.0f} pts</span></div>
                     <div class="signal-bar-track"><div class="signal-bar-fill {date_bar_cls}" style="width:{date_pct}%;"></div></div>
                 </div>
             </div>
@@ -243,6 +283,9 @@ def render_match_result_card(
             <div class="xai-box">
                 <div class="xai-title">Explainable AI Rationale</div>
                 {esc(result.explanation)}
+                <div class="xai-footnote">
+                    Similarity score ({result.final_score:.1f}/100) reflects weighted vector &amp; contextual closeness — not a statistical probability of item identity.
+                </div>
             </div>
         </div>
         """,
@@ -255,34 +298,40 @@ def render_match_result_card(
             st.image(str(img_path), width=320)
 
     if allow_recovery_actions and source_report.get("id") and cand.get("status") == "active":
-        col_a, col_b, _ = st.columns([1.4, 1.4, 2.2])
+        col_a, col_b, _ = st.columns([1.45, 1.45, 2.1])
         with col_a:
             if source_report.get("status") == "active":
                 if st.button(
                     "Mark Pair as Recovered",
                     key=f"{key_prefix}_recover_pair_{cand['id']}",
                     type="primary",
-                    use_container_width=True,
+                    width="stretch",
                 ):
-                    update_report_status(int(source_report["id"]), "recovered")
-                    update_report_status(int(cand["id"]), "recovered")
-                    st.toast(
-                        f"Reports #{source_report['id']} and #{cand['id']} marked as recovered."
-                    )
-                    st.rerun()
+                    try:
+                        update_report_status(int(source_report["id"]), "recovered")
+                        update_report_status(int(cand["id"]), "recovered")
+                        st.toast(
+                            f"Reports #{source_report['id']} and #{cand['id']} marked as recovered."
+                        )
+                        st.rerun()
+                    except (sqlite3.Error, ValueError) as exc:
+                        st.error(f"Could not update recovery status: {exc}")
         with col_b:
             if st.button(
                 f"Mark #{cand['id']} Recovered",
                 key=f"{key_prefix}_recover_cand_{cand['id']}",
-                use_container_width=True,
+                width="stretch",
             ):
-                update_report_status(int(cand["id"]), "recovered")
-                st.toast(f"Report #{cand['id']} marked as recovered.")
-                st.rerun()
+                try:
+                    update_report_status(int(cand["id"]), "recovered")
+                    st.toast(f"Report #{cand['id']} marked as recovered.")
+                    st.rerun()
+                except (sqlite3.Error, ValueError) as exc:
+                    st.error(f"Could not update recovery status: {exc}")
 
 
 def render_dashboard_page() -> None:
-    """Render the main campus overview dashboard."""
+    """Render the responsive campus overview dashboard."""
     render_page_header(
         "ReFind AI Dashboard",
         "Campus-wide lost & found overview powered by local semantic NLP matching.",
@@ -295,67 +344,50 @@ def render_dashboard_page() -> None:
         else 0
     )
 
-    c1, c2, c3, c4 = st.columns(4)
-    with c1:
-        st.markdown(
-            f"""
-            <div class="kpi-card">
+    # Responsive CSS Grid ensures all 4 KPI cards fit comfortably with zero horizontal overflow.
+    st.markdown(
+        f"""
+        <div class="kpi-grid">
+            <div class="kpi-card kpi-navy">
                 <div class="kpi-label">Total Lost Items</div>
                 <div class="kpi-value">{stats["total_lost"]}</div>
                 <div class="kpi-caption">{stats["active_lost"]} currently active</div>
             </div>
-            """,
-            unsafe_allow_html=True,
-        )
-    with c2:
-        st.markdown(
-            f"""
-            <div class="kpi-card">
+            <div class="kpi-card kpi-slate">
                 <div class="kpi-label">Total Found Items</div>
                 <div class="kpi-value">{stats["total_found"]}</div>
                 <div class="kpi-caption">{stats["active_found"]} currently active</div>
             </div>
-            """,
-            unsafe_allow_html=True,
-        )
-    with c3:
-        st.markdown(
-            f"""
-            <div class="kpi-card">
+            <div class="kpi-card kpi-green">
                 <div class="kpi-label">Items Recovered</div>
                 <div class="kpi-value accent-green">{stats["total_recovered"]}</div>
                 <div class="kpi-caption">{recovery_rate}% of all reports resolved</div>
             </div>
-            """,
-            unsafe_allow_html=True,
-        )
-    with c4:
-        st.markdown(
-            f"""
-            <div class="kpi-card">
+            <div class="kpi-card kpi-blue">
                 <div class="kpi-label">Active Reports</div>
                 <div class="kpi-value accent-blue">{stats["active_reports"]}</div>
                 <div class="kpi-caption">Open for AI semantic matching</div>
             </div>
-            """,
-            unsafe_allow_html=True,
-        )
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
 
     st.markdown('<div class="section-heading">Quick Actions</div>', unsafe_allow_html=True)
-    qa1, qa2, qa3 = st.columns(3)
+    qa1, qa2, qa3 = st.columns(3, gap="small")
     with qa1:
-        if st.button("Report a Lost Item", type="primary", use_container_width=True):
+        if st.button("Report a Lost Item", type="primary", width="stretch"):
             navigate_to("Report Lost Item")
     with qa2:
-        if st.button("Report a Found Item", use_container_width=True):
+        if st.button("Report a Found Item", width="stretch"):
             navigate_to("Report Found Item")
     with qa3:
-        if st.button("Open AI Matching Dashboard", use_container_width=True):
+        if st.button("Open AI Matching Dashboard", width="stretch"):
             navigate_to("AI Matching")
 
     st.divider()
 
-    left_col, right_col = st.columns([1.35, 1.0], gap="large")
+    left_col, right_col = st.columns([1.3, 1.0], gap="large")
 
     with left_col:
         st.markdown('<div class="section-heading">Recent Campus Reports</div>', unsafe_allow_html=True)
@@ -378,7 +410,7 @@ def render_dashboard_page() -> None:
             unsafe_allow_html=True,
         )
         st.caption(
-            "Highest-scoring active Lost ↔ Found pairs discovered by `all-MiniLM-L6-v2`."
+            "Strongest active Lost ↔ Found pairs discovered by `all-MiniLM-L6-v2` (similarity scores, not probabilities)."
         )
         active_lost = get_all_reports(report_type="lost", status="active")
         active_found = get_all_reports(report_type="found", status="active")
@@ -401,23 +433,27 @@ def render_dashboard_page() -> None:
                 top_highlights = highlights[:4]
 
                 if not top_highlights:
-                    st.info("No high-confidence active pairs above the 45.0 score threshold right now.")
+                    st.info("No active pairs currently cross the 45.0 similarity highlight threshold.")
                 else:
                     for lost_item, best_match in top_highlights:
                         cand = best_match.candidate
                         tier_label, tier_cls = score_tier(best_match.final_score)
+                        bar_cls = "strong" if best_match.final_score >= 75.0 else ""
                         st.markdown(
                             f"""
-                            <div class="rf-card" style="border-left: 3px solid #2563EB;">
+                            <div class="rf-card" style="border-left: 3px solid {'#16A34A' if best_match.final_score >= 75.0 else '#2563EB'};">
                                 <div class="rf-card-header">
                                     <span class="rf-badge {tier_cls}">{best_match.final_score:.1f}/100 &middot; {esc(tier_label)}</span>
                                     <span style="font-size:0.78rem;color:#64748B;">Semantic: {round(best_match.semantic_score*100)}%</span>
                                 </div>
-                                <div style="font-size:0.9rem;margin:0.35rem 0;">
+                                <div class="overall-bar-track" style="height:6px; margin:0.35rem 0 0.55rem 0;">
+                                    <div class="overall-bar-fill {bar_cls}" style="width:{best_match.final_score:.1f}%;"></div>
+                                </div>
+                                <div style="font-size:0.89rem;line-height:1.45;">
                                     <strong>Lost #{int(lost_item["id"])}:</strong> {esc(lost_item["title"])}<br/>
                                     <strong>Found #{int(cand["id"])}:</strong> {esc(cand["title"])}
                                 </div>
-                                <div style="font-size:0.8rem;color:#475569;margin-top:0.35rem;">
+                                <div style="font-size:0.79rem;color:#475569;margin-top:0.4rem;line-height:1.45;">
                                     {esc(best_match.explanation)}
                                 </div>
                             </div>
@@ -427,25 +463,67 @@ def render_dashboard_page() -> None:
                         if st.button(
                             f"Inspect Match for #{lost_item['id']}",
                             key=f"highlight_open_{lost_item['id']}",
-                            use_container_width=True,
+                            width="stretch",
                         ):
                             navigate_to("AI Matching", report_id=int(lost_item["id"]))
 
 
 def render_ai_matching_page() -> None:
-    """Render the dedicated AI Semantic Matching & Explainability Dashboard."""
+    """Render the dedicated AI Semantic Matching & Academic Demonstration Dashboard."""
     render_page_header(
         "AI Semantic Matching Engine",
-        "Compare natural-language reports using sentence-transformers/all-MiniLM-L6-v2 embeddings and hybrid contextual scoring.",
+        "Natural-language item matching powered by sentence-transformers/all-MiniLM-L6-v2 and explainable hybrid scoring.",
     )
+
+    # Academic workflow overview strip
+    st.markdown(
+        """
+        <div class="workflow-grid">
+            <div class="workflow-step">
+                <div class="workflow-num">Step 1</div>
+                <div class="workflow-title">Text Preprocessing</div>
+                <div class="workflow-desc">Combines title, description, and notes into clean natural language while filtering to opposite report types.</div>
+            </div>
+            <div class="workflow-step">
+                <div class="workflow-num">Step 2</div>
+                <div class="workflow-title">Sentence Embeddings</div>
+                <div class="workflow-desc">Encodes text into 384-D semantic vectors using local <code>all-MiniLM-L6-v2</code> so synonyms sit close together.</div>
+            </div>
+            <div class="workflow-step">
+                <div class="workflow-num">Step 3</div>
+                <div class="workflow-title">Cosine Similarity</div>
+                <div class="workflow-desc">Measures angular vector closeness via Scikit-learn, independent of exact keyword overlap.</div>
+            </div>
+            <div class="workflow-step">
+                <div class="workflow-num">Step 4</div>
+                <div class="workflow-title">Hybrid Fusion &amp; XAI</div>
+                <div class="workflow-desc">Combines Semantic (70%), Category (15%), Location (10%), and Date (5%) with evidence-grounded explanations.</div>
+            </div>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+    with st.expander("How Sentence Embeddings & Cosine Similarity Work (Academic Reference)", expanded=False):
+        st.markdown(
+            """
+            - **Why Not Keyword Search?** A student may report *"blue water bottle"* while a finder logs *"navy reusable drinking bottle"*. Exact keyword matching misses synonymy and paraphrasing.
+            - **Sentence Embeddings (`all-MiniLM-L6-v2`):** A 6-layer MiniLM transformer trained via contrastive Siamese learning maps each item description into a 384-dimensional vector $\\mathbf{v} \\in \\mathbb{R}^{384}$ representing semantic meaning.
+            - **Cosine Similarity:** Measures the cosine of the angle between two embedding vectors:
+              $$\\cos(\\theta) = \\frac{\\mathbf{u} \\cdot \\mathbf{v}}{\\|\\mathbf{u}\\|_2 \\|\\mathbf{v}\\|_2}$$
+              Values are clamped to $[0, 1]$ for weighted scoring, where higher values indicate closer semantic alignment.
+            - **Hybrid Scoring Formula (0–100):**
+              $$\\text{Final Score} = 100 \\times (0.70 \\cdot S_{\\text{sem}} + 0.15 \\cdot S_{\\text{cat}} + 0.10 \\cdot S_{\\text{loc}} + 0.05 \\cdot S_{\\text{date}})$$
+            - **Similarity Score vs. Probability:** A score of **82.4 / 100** indicates strong relative similarity across semantic and contextual signals — it does **not** represent an 82.4% probability that two reports describe the identical physical object.
+            """
+        )
 
     st.markdown(
         """
         <div class="academic-note">
-            <strong>Scoring Transparency Note:</strong> A ReFind AI score (e.g., <strong>86.0 / 100</strong>) is a
-            <em>relative weighted similarity index</em> combining semantic embeddings (70%), category match (15%),
-            normalized location overlap (10%), and date proximity (5%). It is <strong>not</strong> a statistical
-            probability that two reports refer to the identical physical object.
+            <strong>Important Evaluation Note:</strong> ReFind AI scores (0–100) represent a
+            <strong>weighted similarity index</strong>, <strong>not</strong> a statistical probability.
+            Always verify distinguishing details before returning an item.
         </div>
         """,
         unsafe_allow_html=True,
@@ -455,11 +533,33 @@ def render_ai_matching_page() -> None:
     if engine is None:
         return
 
+    all_reports = get_all_reports()
+
+    # Quick academic demo preset selector when seed reports are present
+    seed_lookup = {
+        str(r["seed_key"]): int(r["id"])
+        for r in all_reports
+        if r.get("seed_key") and r.get("status") == "active"
+    }
+    available_presets = [
+        (label, seed_lookup[key])
+        for label, key in DEMO_PRESETS
+        if key in seed_lookup
+    ]
+    if available_presets:
+        st.caption("Quick Academic Demo Cases (click to inspect realistic sample reports):")
+        preset_cols = st.columns(len(available_presets), gap="small")
+        for col, (label, rep_id) in zip(preset_cols, available_presets):
+            with col:
+                if st.button(label, key=f"demo_preset_{rep_id}", width="stretch"):
+                    st.session_state["selected_match_report_id"] = rep_id
+                    st.session_state["ai_match_select_id"] = rep_id
+                    st.rerun()
+
     include_recovered_source = st.checkbox(
         "Include already-recovered reports in source selector",
         value=False,
     )
-    all_reports = get_all_reports()
     source_pool = (
         all_reports
         if include_recovered_source
@@ -470,34 +570,37 @@ def render_ai_matching_page() -> None:
         st.info("No reports available for matching. Submit a Lost or Found report first.")
         return
 
-    # Determine initial selected index if navigated from another page.
-    target_id = st.session_state.get("selected_match_report_id")
-    default_idx = 0
-    if target_id is not None:
-        for idx, rep in enumerate(source_pool):
-            if int(rep["id"]) == int(target_id):
-                default_idx = idx
-                break
+    report_by_id = {int(r["id"]): r for r in source_pool}
+    option_ids = [int(r["id"]) for r in source_pool]
 
-    def _format_option(rep: dict[str, Any]) -> str:
+    # Deterministically synchronize integer report ID selection across navigation and reruns.
+    requested_id = st.session_state.get("selected_match_report_id")
+    if requested_id in report_by_id:
+        st.session_state["ai_match_select_id"] = int(requested_id)
+    elif st.session_state.get("ai_match_select_id") not in report_by_id:
+        st.session_state["ai_match_select_id"] = option_ids[0]
+
+    def _format_id_option(rep_id: int) -> str:
+        rep = report_by_id[int(rep_id)]
         return (
             f"[{rep['report_type'].upper()} #{rep['id']}] {rep['title']} "
             f"— {rep['location']} ({format_display_date(rep['report_date'])})"
         )
 
-    selected_report = st.selectbox(
-        "Select a report to find AI matches for:",
-        options=source_pool,
-        index=default_idx,
-        format_func=_format_option,
+    selected_id = st.selectbox(
+        "Select a report to analyze with ReFind AI:",
+        options=option_ids,
+        format_func=_format_id_option,
+        key="ai_match_select_id",
     )
-    st.session_state["selected_match_report_id"] = int(selected_report["id"])
+    st.session_state["selected_match_report_id"] = int(selected_id)
+    selected_report = report_by_id[int(selected_id)]
 
     # Configurable algorithm weights & threshold
     with st.expander("Configure Hybrid Scoring Weights & Threshold", expanded=False):
         st.caption(
-            "Default academic formula: 70% Semantic + 15% Category + 10% Location + 5% Date Proximity. "
-            "Weights below are normalized automatically to sum to 100%."
+            "Default formula: 70% Semantic + 15% Category + 10% Location + 5% Date Proximity. "
+            "Adjust sliders to test sensitivity; weights normalize automatically to 100%."
         )
         wc1, wc2, wc3, wc4 = st.columns(4)
         raw_sem = wc1.slider("Semantic Weight", 0, 100, 70, step=5)
@@ -567,12 +670,12 @@ def render_ai_matching_page() -> None:
     if not matches:
         st.info(
             f"No {opposite_label.lower()} reports scored at or above {min_threshold:.0f}/100. "
-            "You can lower the threshold or toggle 'Show all opposite-type candidates' in the configuration panel above."
+            "You can lower the threshold or toggle 'Show all opposite-type candidates' above to inspect lower-ranked comparisons."
         )
     else:
         st.caption(
             f"Showing {len(matches)} ranked {opposite_label.lower()} candidate(s) evaluated with "
-            f"`{engine.model_name}` ({engine.embedding_dim}-D embeddings, cosine similarity)."
+            f"`{engine.model_name}` ({engine.embedding_dim}-D embeddings, Scikit-learn cosine similarity)."
         )
         for rank, result in enumerate(matches, start=1):
             render_match_result_card(
@@ -584,16 +687,47 @@ def render_ai_matching_page() -> None:
             )
 
 
+def _init_form_state(report_type: str, force_reset: bool = False) -> None:
+    """Initialize or cleanly reset controlled session-state keys for a report form."""
+    defaults: dict[str, Any] = {
+        f"{report_type}_title": "",
+        f"{report_type}_category": CATEGORIES[0],
+        f"{report_type}_description": "",
+        f"{report_type}_location": "",
+        f"{report_type}_date": date.today(),
+        f"{report_type}_extra": "",
+        f"{report_type}_contact": "",
+    }
+    for key, default_val in defaults.items():
+        if force_reset or key not in st.session_state:
+            st.session_state[key] = default_val
+
+    nonce_key = f"{report_type}_upload_nonce"
+    if nonce_key not in st.session_state:
+        st.session_state[nonce_key] = 0
+    elif force_reset:
+        st.session_state[nonce_key] = int(st.session_state[nonce_key]) + 1
+
+
 def render_report_form_page(report_type: str) -> None:
-    """Render either the Report Lost Item or Report Found Item form."""
+    """Render either the Report Lost Item or Report Found Item form with reliable state handling."""
     is_lost = report_type == "lost"
     page_title = "Report a Lost Item" if is_lost else "Report a Found Item"
     page_subtitle = (
-        "Describe what you misplaced in natural language. ReFind AI will immediately compare it against found campus items."
+        "Describe what you misplaced in natural language. ReFind AI saves your report and immediately checks active found items."
         if is_lost
-        else "Log an item you found on campus. ReFind AI will immediately check active lost reports for a matching owner."
+        else "Log an item you found on campus. ReFind AI saves your report and immediately checks active lost reports."
     )
     render_page_header(page_title, page_subtitle)
+
+    # Reset form inputs ONLY after a previously verified successful submission.
+    should_reset = bool(st.session_state.pop(f"reset_form_{report_type}", False))
+    _init_form_state(report_type, force_reset=should_reset)
+
+    # Display flash confirmation banner persisted across post-submit rerun.
+    flash_msg = st.session_state.pop(f"flash_success_{report_type}", None)
+    if flash_msg:
+        st.success(flash_msg)
 
     loc_label = "Last Seen Location *" if is_lost else "Location Found *"
     date_label = "Date Lost *" if is_lost else "Date Found *"
@@ -613,22 +747,36 @@ def render_report_form_page(report_type: str) -> None:
         else "E.g., Found a brown leather purse-like wallet on a bench outside the central library."
     )
 
-    with st.form(key=f"form_report_{report_type}", clear_on_submit=True):
+    upload_nonce = int(st.session_state[f"{report_type}_upload_nonce"])
+
+    # clear_on_submit=False and enter_to_submit=False prevent premature Enter-key submits
+    # and preserve user input if any validation error occurs.
+    with st.form(
+        key=f"form_report_{report_type}",
+        clear_on_submit=False,
+        enter_to_submit=False,
+    ):
         col1, col2 = st.columns([1.4, 1.0])
         with col1:
             title = st.text_input(
                 "Item Name / Title *",
                 placeholder="E.g., Dark Brown Leather Wallet",
                 max_chars=120,
+                key=f"{report_type}_title",
             )
         with col2:
-            category = st.selectbox("Item Category *", options=CATEGORIES)
+            category = st.selectbox(
+                "Item Category *",
+                options=CATEGORIES,
+                key=f"{report_type}_category",
+            )
 
         description = st.text_area(
             "Detailed Description *",
             placeholder=desc_placeholder,
             height=115,
-            help="Include color, material, brand, size, or distinctive features to help the NLP model find accurate semantic matches.",
+            help="Include color, material, brand, size, or distinctive features so the NLP model can identify semantic matches.",
+            key=f"{report_type}_description",
         )
 
         col3, col4 = st.columns([1.4, 1.0])
@@ -637,18 +785,20 @@ def render_report_form_page(report_type: str) -> None:
                 loc_label,
                 placeholder="E.g., Central Library, Room 204, Main Cafeteria",
                 help="Common campus areas: " + ", ".join(CAMPUS_LOCATION_SUGGESTIONS[:5]),
+                key=f"{report_type}_location",
             )
         with col4:
             report_date = st.date_input(
                 date_label,
-                value=date.today(),
-                max_value=date.today(),
+                max_value=date.today() + timedelta(days=1),
+                key=f"{report_type}_date",
             )
 
         additional_details = st.text_input(
             extra_label,
             placeholder=extra_placeholder,
             max_chars=240,
+            key=f"{report_type}_extra",
         )
 
         col5, col6 = st.columns([1.2, 1.2])
@@ -656,77 +806,128 @@ def render_report_form_page(report_type: str) -> None:
             contact_label = st.text_input(
                 "Campus Desk / Demo Reference (Optional)",
                 placeholder="E.g., Library Desk Ref #108 (Demo)",
-                help="For privacy during academic demos, use a synthetic desk reference rather than private phone numbers or personal emails.",
+                help="For privacy during academic demos, use a synthetic desk reference rather than personal phone numbers or emails.",
+                key=f"{report_type}_contact",
             )
         with col6:
             uploaded_photo = st.file_uploader(
                 "Optional Photograph (PNG, JPG, WEBP)",
                 type=["png", "jpg", "jpeg", "webp"],
+                key=f"{report_type}_photo_{upload_nonce}",
             )
 
         submitted = st.form_submit_button(
             f"Submit {'Lost' if is_lost else 'Found'} Report & Run AI Match",
             type="primary",
-            use_container_width=True,
+            width="stretch",
         )
 
     if submitted:
         errors: list[str] = []
-        if not title.strip():
+        clean_title = (title or "").strip()
+        clean_desc = (description or "").strip()
+        clean_loc = (location or "").strip()
+
+        if not clean_title:
             errors.append("Please enter an item name/title.")
-        if not description.strip() or len(description.strip()) < 8:
-            errors.append("Please provide a descriptive summary (at least 8 characters).")
-        if not location.strip():
+        if not clean_desc or len(clean_desc) < 5:
+            errors.append("Please provide a descriptive summary (at least 5 characters).")
+        if not clean_loc:
             errors.append("Please enter the campus location.")
 
-        image_rel_path: Optional[str] = None
-        if uploaded_photo is not None and not errors:
-            try:
-                image_rel_path = save_uploaded_image(uploaded_photo)
-            except ValueError as exc:
-                errors.append(str(exc))
+        # Defensively handle date picker returning None or a tuple if cleared.
+        valid_date: Optional[date] = None
+        if isinstance(report_date, date):
+            valid_date = report_date
+        elif isinstance(report_date, (tuple, list)) and report_date and isinstance(report_date[0], date):
+            valid_date = report_date[0]
+
+        if valid_date is None:
+            errors.append("Please select a valid date.")
+        elif valid_date > date.today() + timedelta(days=1):
+            errors.append("The selected date cannot be in the future.")
+
+        if not errors and valid_date is not None:
+            # Prevent accidental duplicate submissions (e.g., double-click or repeat submit).
+            existing_dup = find_duplicate_report(
+                title=clean_title,
+                description=clean_desc,
+                report_type=report_type,
+                location=clean_loc,
+                report_date=valid_date.isoformat(),
+            )
+            if existing_dup is not None:
+                st.session_state[f"last_submitted_{report_type}_id"] = int(existing_dup["id"])
+                st.warning(
+                    f"An identical active {report_type} report (**#{existing_dup['id']} — {existing_dup['title']}**) "
+                    "is already saved in the database. Showing its AI match results below without creating a duplicate."
+                )
+            else:
+                image_rel_path: Optional[str] = None
+                if uploaded_photo is not None:
+                    try:
+                        image_rel_path = save_uploaded_image(uploaded_photo)
+                    except (ValueError, OSError) as exc:
+                        errors.append(f"Image upload error: {exc}")
+
+                if not errors:
+                    try:
+                        new_id = insert_report(
+                            title=clean_title,
+                            description=clean_desc,
+                            category=category,
+                            report_type=report_type,
+                            location=clean_loc,
+                            report_date=valid_date.isoformat(),
+                            additional_details=(additional_details or "").strip(),
+                            contact_label=(contact_label or "").strip()
+                            or "Campus Lost & Found Desk (Demo)",
+                            image_path=image_rel_path,
+                        )
+                    except (sqlite3.Error, ValueError) as exc:
+                        errors.append(f"Database error while saving report: {exc}")
+                    else:
+                        # Sync sidebar counts, clear form cleanly, and show confirmation + AI matches.
+                        st.session_state[f"last_submitted_{report_type}_id"] = int(new_id)
+                        st.session_state[f"flash_success_{report_type}"] = (
+                            f"Report **#{new_id} ({clean_title})** has been saved to SQLite. "
+                            "Your report is now live on the Dashboard, Browse Reports, and AI Matching below."
+                        )
+                        st.session_state[f"reset_form_{report_type}"] = True
+                        st.rerun()
 
         if errors:
             for err in errors:
                 st.error(err)
-            return
-
-        new_id = insert_report(
-            title=title,
-            description=description,
-            category=category,
-            report_type=report_type,
-            location=location,
-            report_date=report_date.isoformat(),
-            additional_details=additional_details,
-            contact_label=contact_label or "Campus Lost & Found Desk (Demo)",
-            image_path=image_rel_path,
-        )
-        st.session_state[f"last_submitted_{report_type}_id"] = new_id
-        st.success(
-            f"Report **#{new_id}** saved to the ReFind AI database. "
-            "Running semantic NLP matching against opposite-type active reports below."
-        )
 
     # Show immediate AI matches for the most recently submitted report on this form.
     last_id = st.session_state.get(f"last_submitted_{report_type}_id")
     if last_id is not None:
         saved_report = get_report_by_id(int(last_id))
-        if saved_report is not None:
+        if saved_report is None:
+            st.session_state.pop(f"last_submitted_{report_type}_id", None)
+        else:
             st.divider()
-            hcol1, hcol2 = st.columns([2.5, 1.0])
-            with hcol1:
-                st.markdown(
-                    f'<div class="section-heading">Instant AI Matches for Report #{saved_report["id"]}: {esc(saved_report["title"])}</div>',
-                    unsafe_allow_html=True,
-                )
-            with hcol2:
+            st.markdown(
+                f'<div class="section-heading">Instant AI Matches for Report #{saved_report["id"]}: {esc(saved_report["title"])}</div>',
+                unsafe_allow_html=True,
+            )
+            ac1, ac2, _ = st.columns([1.45, 1.35, 1.2])
+            with ac1:
                 if st.button(
                     "Open in AI Matching Dashboard",
                     key=f"jump_after_submit_{saved_report['id']}",
-                    use_container_width=True,
+                    type="primary",
+                    width="stretch",
                 ):
                     navigate_to("AI Matching", report_id=int(saved_report["id"]))
+            with ac2:
+                if st.button(
+                    "View in Browse Reports",
+                    key=f"browse_after_submit_{saved_report['id']}",
+                    width="stretch",
+                ):
+                    navigate_to("Browse Reports")
 
             engine = try_get_engine()
             if engine is not None:
@@ -736,7 +937,7 @@ def render_report_form_page(report_type: str) -> None:
                 if not matches:
                     st.info(
                         "No opposite-type active reports crossed the 35.0 similarity threshold yet. "
-                        "Your report is now stored and will be matched automatically as new reports arrive."
+                        "Your report is stored in SQLite and will be matched automatically as new opposite-type reports arrive."
                     )
                 else:
                     for idx, res in enumerate(matches, start=1):
@@ -776,7 +977,7 @@ def render_browse_reports_page() -> None:
         search_query=search_query,
     )
 
-    st.caption(f"Displaying **{len(reports)}** matching report(s).")
+    st.caption(f"Displaying **{len(reports)}** matching report(s), newest submitted first.")
 
     if not reports:
         st.info("No reports match the current filters.")
@@ -794,7 +995,7 @@ def render_browse_reports_page() -> None:
                 if st.button(
                     "Find AI Matches",
                     key=f"browse_match_{report['id']}",
-                    use_container_width=True,
+                    width="stretch",
                 ):
                     navigate_to("AI Matching", report_id=int(report["id"]))
             with b2:
@@ -803,29 +1004,44 @@ def render_browse_reports_page() -> None:
                         "Mark as Recovered",
                         key=f"browse_recover_{report['id']}",
                         type="primary",
-                        use_container_width=True,
+                        width="stretch",
                     ):
-                        update_report_status(int(report["id"]), "recovered")
-                        st.toast(f"Report #{report['id']} marked as recovered.")
-                        st.rerun()
+                        try:
+                            update_report_status(int(report["id"]), "recovered")
+                            st.toast(f"Report #{report['id']} marked as recovered.")
+                            st.rerun()
+                        except (sqlite3.Error, ValueError) as exc:
+                            st.error(f"Could not update report status: {exc}")
                 else:
                     if st.button(
                         "Reopen as Active",
                         key=f"browse_reopen_{report['id']}",
-                        use_container_width=True,
+                        width="stretch",
                     ):
-                        update_report_status(int(report["id"]), "active")
-                        st.toast(f"Report #{report['id']} reopened as active.")
-                        st.rerun()
+                        try:
+                            update_report_status(int(report["id"]), "active")
+                            st.toast(f"Report #{report['id']} reopened as active.")
+                            st.rerun()
+                        except (sqlite3.Error, ValueError) as exc:
+                            st.error(f"Could not reopen report: {exc}")
             with b3:
                 if st.button(
                     "Delete",
                     key=f"browse_delete_{report['id']}",
-                    use_container_width=True,
+                    width="stretch",
                 ):
-                    delete_report(int(report["id"]))
-                    st.toast(f"Report #{report['id']} deleted.")
-                    st.rerun()
+                    try:
+                        rep_id = int(report["id"])
+                        delete_report(rep_id)
+                        if st.session_state.get("selected_match_report_id") == rep_id:
+                            st.session_state.pop("selected_match_report_id", None)
+                        for rtype in ("lost", "found"):
+                            if st.session_state.get(f"last_submitted_{rtype}_id") == rep_id:
+                                st.session_state.pop(f"last_submitted_{rtype}_id", None)
+                        st.toast(f"Report #{rep_id} deleted.")
+                        st.rerun()
+                    except sqlite3.Error as exc:
+                        st.error(f"Could not delete report: {exc}")
 
     st.divider()
     with st.expander("Demo Dataset Administration"):
@@ -834,14 +1050,14 @@ def render_browse_reports_page() -> None:
         )
         dc1, dc2 = st.columns(2)
         with dc1:
-            if st.button("Restore Missing Demo Records", use_container_width=True):
+            if st.button("Restore Missing Demo Records", width="stretch"):
                 added = seed_database()
-                st.success(f"Restored {added} synthetic demonstration record(s).")
+                st.toast(f"Restored {added} synthetic demonstration record(s).")
                 st.rerun()
         with dc2:
-            if st.button("Remove Synthetic Demo Records", use_container_width=True):
+            if st.button("Remove Synthetic Demo Records", width="stretch"):
                 removed = delete_seed_reports()
-                st.warning(f"Removed {removed} synthetic demonstration record(s).")
+                st.toast(f"Removed {removed} synthetic demonstration record(s).")
                 st.rerun()
 
 
@@ -884,8 +1100,8 @@ def main() -> None:
         stats = get_dashboard_stats()
         st.markdown(
             f"""
-            <div style="font-size:0.8rem; color:#475569; line-height:1.6;">
-                <div style="font-weight:700; color:#111827; margin-bottom:0.25rem;">System Status</div>
+            <div class="sidebar-status-card">
+                <div class="sidebar-status-title"><span class="status-pulse"></span>System Status</div>
                 <div><strong>AI Model:</strong> all-MiniLM-L6-v2</div>
                 <div><strong>Storage:</strong> SQLite (Persistent)</div>
                 <div><strong>Active Cases:</strong> {stats["active_reports"]} ({stats["active_lost"]} lost / {stats["active_found"]} found)</div>

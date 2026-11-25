@@ -13,7 +13,7 @@ from __future__ import annotations
 from datetime import date, timedelta
 from typing import Any, Optional
 
-from database import PathLike, count_reports, init_db, insert_seed_report
+from database import PathLike, count_reports, get_meta, init_db, insert_seed_report, set_meta
 
 
 def _days_ago(days: int) -> str:
@@ -281,15 +281,23 @@ def seed_database(db_path: Optional[PathLike] = None) -> int:
     for record in get_seed_records():
         if insert_seed_report(record, db_path=db_path):
             inserted += 1
+    set_meta("initial_seed_completed", "1", db_path=db_path)
     return inserted
 
 
 def ensure_seed_data(db_path: Optional[PathLike] = None) -> int:
-    """Populate demo records only when the database is completely empty."""
+    """Populate demo records only once on first-ever database initialization.
+
+    If a user later removes synthetic demo records intentionally, this flag
+    prevents the demo data from unexpectedly reappearing on the next rerun.
+    """
     init_db(db_path)
-    if count_reports(db_path) == 0:
-        return seed_database(db_path)
-    return 0
+    if get_meta("initial_seed_completed", db_path=db_path) == "1":
+        return 0
+    if count_reports(db_path) > 0:
+        set_meta("initial_seed_completed", "1", db_path=db_path)
+        return 0
+    return seed_database(db_path)
 
 
 if __name__ == "__main__":

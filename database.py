@@ -23,9 +23,9 @@ def _resolve_db_path(db_path: Optional[PathLike] = None) -> Path:
 
 
 def get_connection(db_path: Optional[PathLike] = None) -> sqlite3.Connection:
-    """Open a SQLite connection with Row access enabled."""
+    """Open a SQLite connection with Row access and lock timeout enabled."""
     resolved = _resolve_db_path(db_path)
-    conn = sqlite3.connect(str(resolved))
+    conn = sqlite3.connect(str(resolved), timeout=10.0)
     conn.row_factory = sqlite3.Row
     return conn
 
@@ -35,7 +35,10 @@ def _utc_now_iso() -> str:
 
 
 def init_db(db_path: Optional[PathLike] = None) -> Path:
-    """Create the SQLite database file, reports table, and helpful indexes."""
+    """Create the SQLite database file, reports table, app_meta table, and indexes.
+
+    Non-destructive: preserves all existing tables and records.
+    """
     resolved = _resolve_db_path(db_path)
     with get_connection(resolved) as conn:
         conn.execute(
@@ -60,6 +63,14 @@ def init_db(db_path: Optional[PathLike] = None) -> Path:
             """
         )
         conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS app_meta (
+                key TEXT PRIMARY KEY,
+                value TEXT NOT NULL
+            )
+            """
+        )
+        conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_reports_type_status ON reports (report_type, status)"
         )
         conn.execute(
@@ -70,6 +81,61 @@ def init_db(db_path: Optional[PathLike] = None) -> Path:
         )
         conn.commit()
     return resolved
+
+
+def get_meta(key: str, db_path: Optional[PathLike] = None) -> Optional[str]:
+    """Read a metadata value from app_meta, or None if not set."""
+    with get_connection(db_path) as conn:
+        row = conn.execute("SELECT value FROM app_meta WHERE key = ?", (key,)).fetchone()
+        return str(row["value"]) if row is not None else None
+
+
+def set_meta(key: str, value: str, db_path: Optional[PathLike] = None) -> None:
+    """Upsert a metadata key/value pair into app_meta."""
+    with get_connection(db_path) as conn:
+        conn.execute(
+            """
+            INSERT INTO app_meta (key, value)
+            VALUES (?, ?)
+            ON CONFLICT(key) DO UPDATE SET value = excluded.value
+            """,
+            (key, str(value)),
+        )
+        conn.commit()
+
+
+def find_duplicate_report(
+    *,
+    title: str,
+    description: str,
+    report_type: str,
+    location: str,
+    report_date: str,
+    db_path: Optional[PathLike] = None,
+) -> Optional[dict[str, Any]]:
+    """Return an existing matching active report if an identical submission already exists."""
+    clean_title = clean_text(title).lower()
+    clean_desc = clean_text(description).lower()
+    clean_type = clean_text(report_type).lower()
+    clean_loc = clean_text(location).lower()
+    clean_date = clean_text(report_date)
+
+    with get_connection(db_path) as conn:
+        row = conn.execute(
+            """
+            SELECT * FROM reports
+            WHERE report_type = ?
+              AND status = 'active'
+              AND LOWER(TRIM(title)) = ?
+              AND LOWER(TRIM(description)) = ?
+              AND LOWER(TRIM(location)) = ?
+              AND report_date = ?
+            ORDER BY id DESC
+            LIMIT 1
+            """,
+            (clean_type, clean_title, clean_desc, clean_loc, clean_date),
+        ).fetchone()
+        return dict(row) if row is not None else None
 
 
 def insert_report(
@@ -199,7 +265,7 @@ def get_all_reports(
     limit: Optional[int] = None,
     db_path: Optional[PathLike] = None,
 ) -> list[dict[str, Any]]:
-    """Retrieve reports with optional parameterized filtering, newest first."""
+    """Retrieve reports with optional parameterized filtering, most recently created first."""
     clauses: list[str] = []
     params: list[Any] = []
 
@@ -226,7 +292,7 @@ def get_all_reports(
     sql = "SELECT * FROM reports"
     if clauses:
         sql += " WHERE " + " AND ".join(clauses)
-    sql += " ORDER BY report_date DESC, id DESC"
+    sql += " ORDER BY created_at DESC, id DESC"
 
     if limit is not None and int(limit) > 0:
         sql += " LIMIT ?"

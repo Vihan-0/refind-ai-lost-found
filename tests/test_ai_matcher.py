@@ -1,22 +1,29 @@
-"""Automated verification suite for ReFind AI matching engine and SQLite persistence.
+"""Automated verification suite for ReFind AI matching engine, UI workflows, and SQLite persistence.
 
-Covers all required academic validation scenarios:
+Covers all required academic validation scenarios and v1.1 workflow tests:
 1. Strong semantic match (wallet near library)
 2. Different wording / paraphrased description (blue water bottle vs. navy drinking bottle)
 3. Different categories & unrelated items (wallet vs. wireless headphones)
 4. Same category, different item contrast (red backpack vs. blue school bag)
 5. Strict opposite report-type enforcement (no lost↔lost or found↔found matches)
 6. SQLite persistence across reopened connections & idempotent seeding
-Plus contextual scoring unit tests, weight validation, edge cases, and XAI checks.
+7. End-to-end Lost Item submission via Streamlit AppTest (SQLite, Dashboard, Browse, AI Matching, duplicate guard)
+8. End-to-end Found Item submission via Streamlit AppTest (SQLite, Browse, AI Matching)
+9. Form validation preserving user inputs (no wipeout on error)
+10. Recovery management & non-resurrecting demo record removal
+11. Weighted contribution breakdown accuracy & all five views rendering cleanly
 """
 
 from __future__ import annotations
 
 import math
+from datetime import date, timedelta
 from pathlib import Path
 
 import pytest
+from streamlit.testing.v1 import AppTest
 
+import database
 from ai_matcher import (
     DEFAULT_MODEL_NAME,
     EmbeddingEngine,
@@ -29,19 +36,34 @@ from ai_matcher import (
 )
 from database import (
     count_reports,
+    delete_seed_reports,
+    get_all_reports,
     get_dashboard_stats,
     get_report_by_id,
     init_db,
     insert_report,
     update_report_status,
 )
-from seed_data import seed_database
+from seed_data import ensure_seed_data, seed_database
+
+
+APP_PATH = Path(__file__).resolve().parent.parent / "app.py"
 
 
 @pytest.fixture(scope="module")
 def engine() -> EmbeddingEngine:
     """Load the genuine pretrained Sentence Transformer model once for the test module."""
     return EmbeddingEngine(model_name=DEFAULT_MODEL_NAME)
+
+
+@pytest.fixture()
+def isolated_app_db(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
+    """Point database.DEFAULT_DB_PATH to an isolated temp SQLite file for UI AppTest runs."""
+    db_file = tmp_path / "app_test_refind.db"
+    monkeypatch.setattr(database, "DEFAULT_DB_PATH", db_file)
+    init_db(db_file)
+    ensure_seed_data(db_file)
+    return db_file
 
 
 # ---------------------------------------------------------------------------
@@ -123,7 +145,6 @@ def test_2_different_wording_paraphrase(engine: EmbeddingEngine) -> None:
         apply_threshold=False,
     )
     assert len(matches) == 2
-    # Bottle must rank #1 over unrelated item and show clear semantic recognition.
     assert matches[0].candidate["id"] == 11
     assert matches[0].semantic_score >= 0.50
     assert matches[0].final_score >= 50.0
@@ -207,7 +228,6 @@ def test_4_same_category_different_item(engine: EmbeddingEngine) -> None:
     assert len(matches) == 2
     assert matches[0].candidate["id"] == 32
     assert matches[1].candidate["id"] == 31
-    # Both share the same category (15% weight), yet the closer description + context wins clearly.
     assert matches[0].category_score == 1.0
     assert matches[1].category_score == 1.0
     assert matches[0].final_score > matches[1].final_score + 20.0
@@ -268,21 +288,21 @@ def test_6_sqlite_persistence_and_seed_idempotency(tmp_path: Path) -> None:
     db_file = tmp_path / "test_refind.db"
     init_db(db_file)
 
-    # First seed inserts records; second seed must insert zero duplicates.
     first_inserted = seed_database(db_file)
     assert first_inserted >= 12
     second_inserted = seed_database(db_file)
     assert second_inserted == 0
     initial_total = count_reports(db_file)
 
-    # Insert a brand-new user report and simulate reopening the app via fresh DB queries.
+    # Even with an older report_date, newly inserted report must rank first in recent reports.
+    older_date = (date.today() - timedelta(days=10)).isoformat()
     new_id = insert_report(
         title="Green Mechanical Pencil Case",
         description="Lost a dark green zippered canvas pencil pouch in Lecture Hall B.",
         category="Books & Stationery",
         report_type="lost",
         location="Lecture Hall B",
-        report_date="2026-11-25",
+        report_date=older_date,
         db_path=db_file,
     )
 
@@ -292,7 +312,9 @@ def test_6_sqlite_persistence_and_seed_idempotency(tmp_path: Path) -> None:
     assert reloaded["status"] == "active"
     assert count_reports(db_file) == initial_total + 1
 
-    # Mark recovered and verify dashboard stats update cleanly.
+    recent = get_all_reports(limit=6, db_path=db_file)
+    assert recent[0]["id"] == new_id
+
     stats_before = get_dashboard_stats(db_file)
     assert update_report_status(new_id, "recovered", db_path=db_file) is True
     stats_after = get_dashboard_stats(db_file)
@@ -301,7 +323,7 @@ def test_6_sqlite_persistence_and_seed_idempotency(tmp_path: Path) -> None:
 
 
 # ---------------------------------------------------------------------------
-# Unit Tests for Contextual Signals, Formula Math, Edge Cases & Validation
+# Unit Tests for Contextual Signals, Contributions, Edge Cases & Validation
 # ---------------------------------------------------------------------------
 
 
@@ -333,7 +355,6 @@ def test_contextual_scoring_components() -> None:
     missing_date, delta_none = compute_date_proximity_score("", "2026-11-25")
     assert missing_date == 0.0 and delta_none is None
 
-    # Exact weighted formula check: 0.70*0.8 + 0.15*1.0 + 0.10*0.5 + 0.05*1.0 = 0.81 -> 81.0
     score = compute_hybrid_score(
         semantic_score=0.80,
         category_score=1.0,
@@ -341,6 +362,41 @@ def test_contextual_scoring_components() -> None:
         date_score=1.0,
     )
     assert score == 81.0
+
+
+def test_weighted_contributions_match_final_score(engine: EmbeddingEngine) -> None:
+    """Ensure exposed weighted contributions sum accurately to final_score."""
+    lost_item = {
+        "id": 70,
+        "title": "Black Leather Wallet",
+        "description": "Lost dark leather bifold wallet near central library.",
+        "category": "Wallet & Cards",
+        "report_type": "lost",
+        "location": "Central Library",
+        "report_date": "2026-11-25",
+        "status": "active",
+    }
+    found_item = {
+        "id": 71,
+        "title": "Dark Leather Bifold Wallet",
+        "description": "Found brown-black leather wallet outside central library.",
+        "category": "Wallet & Cards",
+        "report_type": "found",
+        "location": "Outside Central Library",
+        "report_date": "2026-11-24",
+        "status": "active",
+    }
+
+    matches = find_matches(lost_item, [found_item], engine, apply_threshold=False)
+    assert len(matches) == 1
+    res = matches[0]
+    contrib_sum = (
+        res.semantic_contribution
+        + res.category_contribution
+        + res.location_contribution
+        + res.date_contribution
+    )
+    assert abs(contrib_sum - res.final_score) <= 0.25
 
 
 def test_empty_description_and_missing_fields_graceful(engine: EmbeddingEngine) -> None:
@@ -378,3 +434,165 @@ def test_match_config_rejects_invalid_weights() -> None:
         MatchConfig(weight_semantic=0.5, weight_category=0.5, weight_location=0.2, weight_date=0.0)
     with pytest.raises(ValueError):
         MatchConfig(weight_semantic=-0.1, weight_category=0.5, weight_location=0.4, weight_date=0.2)
+
+
+def test_remove_demo_records_does_not_auto_resurrect(tmp_path: Path) -> None:
+    """Removing synthetic demo records must remain removed across app reruns."""
+    db_file = tmp_path / "demo_remove.db"
+    init_db(db_file)
+    inserted = ensure_seed_data(db_file)
+    assert inserted > 0
+
+    removed = delete_seed_reports(db_file)
+    assert removed == inserted
+    assert count_reports(db_file) == 0
+
+    # Simulating next Streamlit rerun calling ensure_seed_data() must NOT re-insert seeds.
+    assert ensure_seed_data(db_file) == 0
+    assert count_reports(db_file) == 0
+
+
+# ---------------------------------------------------------------------------
+# End-to-End Streamlit AppTest Workflow Tests (v1.1)
+# ---------------------------------------------------------------------------
+
+
+def test_lost_item_submission_workflow_end_to_end(isolated_app_db: Path) -> None:
+    """Verify Report Lost Item inserts into SQLite, resets form, guards duplicates, and reaches Dashboard, Browse & AI Matching."""
+    before_stats = get_dashboard_stats(isolated_app_db)
+
+    at = AppTest.from_file(str(APP_PATH), default_timeout=60).run()
+    assert not at.exception
+
+    # Navigate to Report Lost Item
+    at.sidebar.radio[0].set_value("Report Lost Item").run()
+    assert not at.exception
+
+    title_val = "Matte Black Leather Bi-Fold Wallet"
+    desc_val = "Lost my matte black leather wallet outside the central library entrance."
+    loc_val = "Central Library"
+
+    at.text_input(key="lost_title").set_value(title_val)
+    at.selectbox(key="lost_category").set_value("Wallet & Cards")
+    at.text_area(key="lost_description").set_value(desc_val)
+    at.text_input(key="lost_location").set_value(loc_val)
+    at.date_input(key="lost_date").set_value(date.today() - timedelta(days=5))
+    at.button[0].click().run()
+
+    assert not at.exception
+    assert len(at.error) == 0
+    assert any(title_val in msg.value for msg in at.success)
+
+    # Form must have cleanly reset after successful submission
+    assert at.text_input(key="lost_title").value == ""
+    assert at.text_area(key="lost_description").value == ""
+
+    # Verify SQLite persistence and KPI update
+    after_stats = get_dashboard_stats(isolated_app_db)
+    assert after_stats["total_lost"] == before_stats["total_lost"] + 1
+    assert after_stats["active_reports"] == before_stats["active_reports"] + 1
+
+    # Duplicate submission must be blocked cleanly without adding a second row
+    at.text_input(key="lost_title").set_value(title_val)
+    at.selectbox(key="lost_category").set_value("Wallet & Cards")
+    at.text_area(key="lost_description").set_value(desc_val)
+    at.text_input(key="lost_location").set_value(loc_val)
+    at.date_input(key="lost_date").set_value(date.today() - timedelta(days=5))
+    at.button[0].click().run()
+    assert not at.exception
+    assert len(at.warning) >= 1
+    assert get_dashboard_stats(isolated_app_db)["total_lost"] == after_stats["total_lost"]
+
+    # Verify report appears immediately on Dashboard Recent Campus Reports (even with 5-day-old date)
+    at.sidebar.radio[0].set_value("Dashboard").run()
+    assert not at.exception
+    dashboard_md = "\n".join(m.value for m in at.markdown)
+    assert title_val in dashboard_md
+
+    # Verify report appears in Browse Reports
+    at.sidebar.radio[0].set_value("Browse Reports").run()
+    assert not at.exception
+    browse_md = "\n".join(m.value for m in at.markdown)
+    assert title_val in browse_md
+
+    # Verify report is available in AI Matching and matches opposite-type Found wallet
+    at.sidebar.radio[0].set_value("AI Matching").run()
+    assert not at.exception
+    select_options = at.selectbox(key="ai_match_select_id").options
+    newest_report = get_all_reports(report_type="lost", db_path=isolated_app_db)[0]
+    assert any(f"[LOST #{newest_report['id']}]" in opt for opt in select_options)
+    at.selectbox(key="ai_match_select_id").select(newest_report["id"]).run()
+    assert not at.exception
+    assert at.selectbox(key="ai_match_select_id").value == newest_report["id"]
+    matcher_md = "\n".join(m.value for m in at.markdown)
+    assert "Brown Leather Purse-Style Wallet" in matcher_md
+
+    # Verify Recovery Management from Browse Reports persists to SQLite & updates KPIs
+    at.sidebar.radio[0].set_value("Browse Reports").run()
+    assert not at.exception
+    at.button(key=f"browse_recover_{newest_report['id']}").click().run()
+    assert not at.exception
+    recovered_record = get_report_by_id(newest_report["id"], db_path=isolated_app_db)
+    assert recovered_record is not None and recovered_record["status"] == "recovered"
+    final_stats = get_dashboard_stats(isolated_app_db)
+    assert final_stats["total_recovered"] == after_stats["total_recovered"] + 1
+    assert final_stats["active_reports"] == after_stats["active_reports"] - 1
+
+
+def test_found_item_submission_workflow_end_to_end(isolated_app_db: Path) -> None:
+    """Verify Report Found Item inserts into SQLite and becomes immediately matchable against Lost reports."""
+    before_stats = get_dashboard_stats(isolated_app_db)
+
+    at = AppTest.from_file(str(APP_PATH), default_timeout=60).run()
+    at.sidebar.radio[0].set_value("Report Found Item").run()
+    assert not at.exception
+
+    title_val = "Found Casio FX-991EX Scientific Calculator"
+    desc_val = "Found a black Casio scientific engineering calculator left near a CS Lab computer."
+    loc_val = "Computer Science Lab"
+
+    at.text_input(key="found_title").set_value(title_val)
+    at.selectbox(key="found_category").set_value("Electronics")
+    at.text_area(key="found_description").set_value(desc_val)
+    at.text_input(key="found_location").set_value(loc_val)
+    at.button[0].click().run()
+
+    assert not at.exception
+    assert len(at.error) == 0
+    assert any(title_val in msg.value for msg in at.success)
+
+    after_stats = get_dashboard_stats(isolated_app_db)
+    assert after_stats["total_found"] == before_stats["total_found"] + 1
+
+    # Instant AI matching below form should surface the matching Lost Casio calculator
+    page_md = "\n".join(m.value for m in at.markdown)
+    assert "Casio Scientific Calculator" in page_md
+
+
+def test_form_validation_preserves_user_input_on_error(isolated_app_db: Path) -> None:
+    """Invalid submission must show clear errors without inserting or wiping user input."""
+    before_count = count_reports(isolated_app_db)
+
+    at = AppTest.from_file(str(APP_PATH), default_timeout=60).run()
+    at.sidebar.radio[0].set_value("Report Lost Item").run()
+
+    at.text_input(key="lost_title").set_value("Blue Keychain")
+    at.text_area(key="lost_description").set_value("Key")  # Too short (<5 chars)
+    at.text_input(key="lost_location").set_value("")  # Missing required location
+    at.button[0].click().run()
+
+    assert not at.exception
+    assert len(at.error) == 2
+    assert count_reports(isolated_app_db) == before_count
+    # Previously typed values must still be preserved so user can fix and resubmit
+    assert at.text_input(key="lost_title").value == "Blue Keychain"
+    assert at.text_area(key="lost_description").value == "Key"
+
+
+def test_all_five_views_render_without_exceptions(isolated_app_db: Path) -> None:
+    """Confirm all five ReFind AI views load cleanly with zero exceptions."""
+    at = AppTest.from_file(str(APP_PATH), default_timeout=60).run()
+    assert not at.exception
+    for page in ["Dashboard", "AI Matching", "Report Lost Item", "Report Found Item", "Browse Reports"]:
+        at.sidebar.radio[0].set_value(page).run()
+        assert not at.exception, f"View '{page}' raised: {at.exception}"

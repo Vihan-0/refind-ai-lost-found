@@ -90,6 +90,10 @@ class MatchResult:
     shared_location_tokens: list[str]
     explanation: str
     meets_threshold: bool
+    semantic_contribution: float = 0.0
+    category_contribution: float = 0.0
+    location_contribution: float = 0.0
+    date_contribution: float = 0.0
 
 
 class EmbeddingEngine:
@@ -416,6 +420,11 @@ def find_matches(
         if apply_threshold and not meets:
             continue
 
+        sem_contrib = round(cfg.weight_semantic * sem_score * 100.0, 1)
+        cat_contrib = round(cfg.weight_category * cat_score * 100.0, 1)
+        loc_contrib = round(cfg.weight_location * loc_score * 100.0, 1)
+        date_contrib = round(cfg.weight_date * date_score * 100.0, 1)
+
         results.append(
             MatchResult(
                 candidate=cand,
@@ -430,6 +439,10 @@ def find_matches(
                 shared_location_tokens=shared_tokens,
                 explanation=explanation,
                 meets_threshold=meets,
+                semantic_contribution=sem_contrib,
+                category_contribution=cat_contrib,
+                location_contribution=loc_contrib,
+                date_contribution=date_contrib,
             )
         )
 
