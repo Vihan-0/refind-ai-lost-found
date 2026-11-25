@@ -1,21 +1,24 @@
-"""ReFind AI — Intelligent AI-Powered Lost & Found Management System (v1.1).
+"""ReFind AI V2.0 — Intelligent AI-Powered Campus Lost & Found Platform.
 
-Streamlit web application providing:
-- Responsive Campus Dashboard with live KPIs, recent reports, and top AI match highlights
-- Academic-grade AI Matching Dashboard powered by sentence-transformers/all-MiniLM-L6-v2
-- Reliable Report Lost Item & Report Found Item forms with duplicate guard & instant AI matching
-- Browse & Manage Reports with search, multi-filter, and persistent recovery management
+Built on the verified V1.2 engineering baseline with a unified V2.0 Design System:
+- Action-first Dashboard with sleek metric ribbon, lazy AI highlights, and activity feed
+- Split-workspace AI Matching studio with progressive-disclosure score breakdowns
+- Guided Lost & Found reporting forms with above-the-fold post-submit AI results
+- Browse Campus Reports directory with keyword search, sorting, pagination, editing,
+  and two-step delete confirmation with safe upload cleanup
 """
 
 from __future__ import annotations
 
-import html
+import math
 import sqlite3
+from dataclasses import dataclass, field
 from datetime import date, timedelta
 from typing import Any, Optional
 
 import streamlit as st
 
+import database
 from ai_matcher import (
     DEFAULT_MODEL_NAME,
     EmbeddingEngine,
@@ -23,30 +26,48 @@ from ai_matcher import (
     MatchResult,
     ModelLoadError,
     find_matches,
+    find_top_match_highlights,
 )
 from database import (
-    delete_report,
-    delete_seed_reports,
+    count_seed_reports,
+    delete_report_with_cleanup,
+    delete_seed_reports_with_cleanup,
     find_duplicate_report,
     get_all_reports,
     get_dashboard_stats,
     get_report_by_id,
+    get_reports_version,
     init_db,
     insert_report,
+    update_report,
     update_report_status,
 )
 from seed_data import ensure_seed_data, seed_database
+from ui_components import (
+    build_comparison_chips_html,
+    build_metadata_html,
+    build_report_badges_html,
+    esc,
+    format_relative_date,
+    match_tier_display,
+    render_empty_state,
+    render_how_ai_works_content,
+    render_metric_ribbon,
+    render_page_header,
+    render_report_body,
+    render_score_breakdown_grid,
+    render_section_label,
+)
 from utils import (
     BASE_DIR,
     CAMPUS_LOCATION_SUGGESTIONS,
     CATEGORIES,
-    format_display_date,
+    parse_iso_date,
     resolve_image_path,
     save_uploaded_image,
-    score_tier,
 )
 
-PAGES = [
+PAGES: list[str] = [
     "Dashboard",
     "AI Matching",
     "Report Lost Item",
@@ -61,473 +82,602 @@ DEMO_PRESETS: list[tuple[str, str]] = [
     ("Red vs. Blue Bag", "seed_lost_red_backpack"),
 ]
 
+SORT_OPTIONS: dict[str, str] = {
+    "Newest Submitted": "newest",
+    "Oldest Submitted": "oldest",
+    "Most Recent Item Date": "date_desc",
+    "Earliest Item Date": "date_asc",
+    "Title (A–Z)": "title_asc",
+}
+
+BROWSE_PAGE_SIZE = 8
+CUSTOM_LOCATION_OPTION = "Custom location (type below)"
+
+
+# ---------------------------------------------------------------------------
+# Styling & AI Engine State Management (Preserves V1.2 Lazy Loading & Caching)
+# ---------------------------------------------------------------------------
+
 
 def load_stylesheet() -> None:
-    """Inject the custom SaaS dashboard CSS from assets/styles.css."""
+    """Inject the V2.0 Design System CSS from assets/styles.css."""
     css_path = BASE_DIR / "assets" / "styles.css"
     if css_path.exists():
-        st.markdown(f"<style>{css_path.read_text(encoding='utf-8')}</style>", unsafe_allow_html=True)
-
-
-@st.cache_resource(show_spinner="Loading ReFind AI semantic model (all-MiniLM-L6-v2)...")
-def get_embedding_engine(model_name: str = DEFAULT_MODEL_NAME) -> EmbeddingEngine:
-    """Load the Sentence Transformer model once per process via Streamlit cache."""
-    return EmbeddingEngine(model_name=model_name)
-
-
-def try_get_engine() -> Optional[EmbeddingEngine]:
-    """Return cached EmbeddingEngine or render a clear error without keyword fallback."""
-    try:
-        return get_embedding_engine(DEFAULT_MODEL_NAME)
-    except ModelLoadError as exc:
-        st.error(
-            "**AI Embedding Model Unavailable**\n\n"
-            f"{exc}\n\n"
-            "ReFind AI does not silently substitute keyword search for semantic embeddings. "
-            "Please ensure `sentence-transformers` is installed and internet access is available "
-            "for the initial download of `sentence-transformers/all-MiniLM-L6-v2`."
+        st.markdown(
+            f"<style>{css_path.read_text(encoding='utf-8')}</style>",
+            unsafe_allow_html=True,
         )
+
+
+@dataclass
+class EngineState:
+    """Process-scoped AI engine lifecycle state & versioned highlights cache."""
+
+    engine: Optional[EmbeddingEngine] = None
+    status: str = "not_initialized"  # "not_initialized" | "ready" | "unavailable"
+    error_message: Optional[str] = None
+    highlights_cache: dict[tuple[str, str], list[tuple[dict[str, Any], MatchResult]]] = field(
+        default_factory=dict
+    )
+
+
+@st.cache_resource
+def get_engine_state() -> EngineState:
+    """Return process-wide AI engine state WITHOUT loading the transformer model."""
+    return EngineState()
+
+
+def ensure_engine_loaded(force_retry: bool = False) -> Optional[EmbeddingEngine]:
+    """Load the Sentence Transformer model lazily on demand and track honest status."""
+    state = get_engine_state()
+    if state.status == "ready" and state.engine is not None:
+        return state.engine
+    if state.status == "unavailable" and not force_retry:
         return None
+
+    with st.spinner("Loading ReFind AI semantic model (all-MiniLM-L6-v2)..."):
+        try:
+            engine = EmbeddingEngine(model_name=DEFAULT_MODEL_NAME)
+        except ModelLoadError as exc:
+            state.engine = None
+            state.status = "unavailable"
+            state.error_message = str(exc)
+            return None
+        state.engine = engine
+        state.status = "ready"
+        state.error_message = None
+        return engine
+
+
+def try_get_engine(force_retry: bool = False) -> Optional[EmbeddingEngine]:
+    """Return ready EmbeddingEngine or render a clear error without keyword fallback."""
+    engine = ensure_engine_loaded(force_retry=force_retry)
+    if engine is not None:
+        return engine
+
+    state = get_engine_state()
+    st.error(
+        "**AI Embedding Model Unavailable**\n\n"
+        f"{state.error_message or 'Unknown model initialization error.'}\n\n"
+        "ReFind AI does not silently substitute keyword search for semantic embeddings. "
+        "Ensure `sentence-transformers` is installed and internet access is available "
+        "for the initial download of `sentence-transformers/all-MiniLM-L6-v2`."
+    )
+    return None
+
+
+def get_cached_dashboard_highlights(
+    engine: EmbeddingEngine,
+) -> list[tuple[dict[str, Any], MatchResult]]:
+    """Return vectorized Top AI Match Highlights cached by current database version."""
+    state = get_engine_state()
+    db_key = str(database._resolve_db_path())
+    version_key = get_reports_version()
+    cache_key = (db_key, version_key)
+
+    if cache_key in state.highlights_cache:
+        return state.highlights_cache[cache_key]
+
+    for existing_key in [k for k in state.highlights_cache if k[0] == db_key]:
+        state.highlights_cache.pop(existing_key, None)
+
+    active_lost = get_all_reports(report_type="lost", status="active")
+    active_found = get_all_reports(report_type="found", status="active")
+    highlights = find_top_match_highlights(
+        active_lost,
+        active_found,
+        engine,
+        config=MatchConfig(min_score_threshold=45.0, max_results=1),
+        max_highlights=4,
+    )
+    state.highlights_cache[cache_key] = highlights
+    return highlights
 
 
 def navigate_to(page: str, report_id: Optional[int] = None) -> None:
     """Queue a clean navigation transition for the next rerun."""
     st.session_state["nav_target"] = page
     if report_id is not None:
-        st.session_state["selected_match_report_id"] = int(report_id)
+        st.session_state["pending_match_report_id"] = int(report_id)
     st.rerun()
 
 
-def esc(value: Any) -> str:
-    """Escape dynamic text safely before rendering inside HTML templates."""
-    return html.escape("" if value is None else str(value))
+# ---------------------------------------------------------------------------
+# Integrated Match Card Component (Progressive Disclosure + Deliberate Recovery)
+# ---------------------------------------------------------------------------
 
 
-def render_page_header(title: str, subtitle: str) -> None:
-    st.markdown(
-        f"""
-        <div class="page-header">
-            <h1 class="page-title">{esc(title)}</h1>
-            <p class="page-subtitle">{esc(subtitle)}</p>
-        </div>
-        """,
-        unsafe_allow_html=True,
-    )
+def _concise_explanation(full_text: str) -> str:
+    """Return a crisp 1-2 sentence summary for primary card display."""
+    sentences = [s.strip() for s in full_text.split(". ") if s.strip()]
+    if len(sentences) <= 2:
+        return full_text
+    joined = ". ".join(sentences[:2])
+    return joined if joined.endswith(".") else joined + "."
 
 
-def render_report_card_html(report: dict[str, Any], compact: bool = False) -> str:
-    """Build clean, responsive HTML markup for a lost or found report card."""
-    rtype = str(report["report_type"]).lower()
-    status = str(report["status"]).lower()
-    type_cls = "badge-lost" if rtype == "lost" else "badge-found"
-    status_cls = "badge-recovered" if status == "recovered" else "badge-active"
-    card_cls = "card-recovered" if status == "recovered" else (
-        "card-lost" if rtype == "lost" else "card-found"
-    )
-
-    desc = str(report.get("description") or "")
-    if compact and len(desc) > 155:
-        desc = desc[:152].rstrip() + "..."
-
-    extra_html = ""
-    if not compact and report.get("additional_details"):
-        extra_html = (
-            f'<div class="rf-meta-row" style="margin-top:0.45rem;">'
-            f'<span class="rf-meta-item"><strong>Additional Notes:</strong> {esc(report["additional_details"])}</span>'
-            f"</div>"
-        )
-
-    contact_html = ""
-    if not compact and report.get("contact_label"):
-        contact_html = (
-            f'<span class="rf-meta-item"><strong>Reference:</strong> {esc(report["contact_label"])}</span>'
-        )
-
-    return f"""
-    <div class="rf-card {card_cls}">
-        <div class="rf-card-header">
-            <div style="min-width:0; flex:1;">
-                <div class="rf-card-title">#{int(report["id"])} &middot; {esc(report["title"])}</div>
-            </div>
-            <div style="display:flex; gap:0.35rem; flex-wrap:wrap; justify-content:flex-end;">
-                <span class="rf-badge {type_cls}"><span class="rf-badge-dot"></span>{esc(rtype.upper())}</span>
-                <span class="rf-badge {status_cls}"><span class="rf-badge-dot"></span>{esc(status.upper())}</span>
-            </div>
-        </div>
-        <p class="rf-card-desc">{esc(desc)}</p>
-        <div class="rf-meta-row">
-            <span class="rf-meta-item"><strong>Category:</strong> {esc(report["category"])}</span>
-            <span class="rf-meta-item"><strong>Location:</strong> {esc(report["location"])}</span>
-            <span class="rf-meta-item"><strong>Date:</strong> {esc(format_display_date(report["report_date"]))}</span>
-            {contact_html}
-        </div>
-        {extra_html}
-    </div>
-    """
-
-
-def render_match_result_card(
+def render_integrated_match_card(
+    *,
     rank: int,
     result: MatchResult,
     source_report: dict[str, Any],
     config: MatchConfig,
     key_prefix: str,
     allow_recovery_actions: bool = True,
+    expand_breakdown_default: bool = False,
 ) -> None:
-    """Render an Explainable AI match card with weighted contribution breakdown."""
+    """Render an integrated native-container AI match card with progressive disclosure."""
     cand = result.candidate
-    tier_label, tier_cls = score_tier(result.final_score)
+    cand_id = int(cand["id"])
+    src_id = int(source_report["id"]) if source_report.get("id") is not None else None
+
+    tier_label, tier_cls = match_tier_display(result.final_score)
     is_strong = result.final_score >= 75.0
-    card_accent = "tier-strong" if is_strong else ""
-    bar_accent = "strong" if is_strong else ""
+    overall_pct = max(0.0, min(100.0, result.final_score))
+    bar_cls = "fill-strong" if is_strong else ""
+    rationale_cls = "strong" if is_strong else ""
 
     rtype = str(cand["report_type"]).lower()
-    type_cls = "badge-lost" if rtype == "lost" else "badge-found"
+    type_cls = "pill-lost" if rtype == "lost" else "pill-found"
     status = str(cand["status"]).lower()
-    status_cls = "badge-recovered" if status == "recovered" else "badge-active"
-
-    top_pick_html = (
-        '<span class="rf-badge badge-top-pick">Top Candidate</span>'
-        if rank == 1 and result.final_score >= 60.0
+    status_pill = (
+        '<span class="rf-pill pill-recovered"><span class="rf-pill-dot"></span>Recovered</span>'
+        if status == "recovered"
         else ""
     )
+    rank_pill = (
+        '<span class="rf-pill pill-rank">Top Match</span>'
+        if rank == 1 and result.final_score >= 60.0
+        else f'<span class="rf-pill pill-neutral">Rank #{rank}</span>'
+    )
 
-    sem_pct = round(result.semantic_score * 100)
-    cat_pct = round(result.category_score * 100)
-    loc_pct = round(result.location_score * 100)
-    date_pct = round(result.date_score * 100)
-
-    max_sem = round(config.weight_semantic * 100.0, 1)
-    max_cat = round(config.weight_category * 100.0, 1)
-    max_loc = round(config.weight_location * 100.0, 1)
-    max_date = round(config.weight_date * 100.0, 1)
-
-    sem_pts = result.semantic_contribution
-    cat_pts = result.category_contribution
-    loc_pts = result.location_contribution
-    date_pts = result.date_contribution
-
-    sem_bar_cls = "green" if sem_pct >= 70 else ""
-    cat_bar_cls = "green" if cat_pct >= 100 else ""
-    loc_bar_cls = "green" if loc_pct >= 70 else ""
-    date_bar_cls = "green" if date_pct >= 70 else ""
-
-    days_label = (
-        "Same day"
+    days_suffix = (
+        "same day"
         if result.days_apart == 0
-        else (f"{result.days_apart}d apart" if result.days_apart is not None else "Date N/A")
+        else (f"{result.days_apart}d apart" if result.days_apart is not None else None)
     )
-    overall_pct = max(0.0, min(100.0, result.final_score))
+    meta_html = build_metadata_html(
+        category=str(cand.get("category") or "Other"),
+        location=str(cand.get("location") or "Unspecified"),
+        report_date=str(cand.get("report_date") or ""),
+        contact=str(cand.get("contact_label") or "Campus Desk"),
+        date_suffix=days_suffix,
+    )
+    comparison_chips_html = build_comparison_chips_html(source_report, result)
 
-    st.markdown(
-        f"""
-        <div class="match-card {card_accent}">
-            <div class="rf-card-header">
+    with st.container(border=True):
+        st.markdown(
+            f"""
+            <div class="rf-match-header">
                 <div style="min-width:0; flex:1;">
-                    <div style="display:flex; align-items:center; gap:0.4rem; flex-wrap:wrap; margin-bottom:0.4rem;">
-                        {top_pick_html}
-                        <span class="rf-badge {type_cls}"><span class="rf-badge-dot"></span>{esc(rtype.upper())} #{int(cand["id"])}</span>
-                        <span class="rf-badge {tier_cls}">Rank #{rank} &middot; {esc(tier_label)}</span>
-                        <span class="rf-badge {status_cls}">{esc(status.upper())}</span>
+                    <div class="rf-pill-row" style="margin-bottom:0.4rem;">
+                        {rank_pill}
+                        <span class="rf-pill {type_cls}"><span class="rf-pill-dot"></span>{esc(rtype.capitalize())} #{cand_id}</span>
+                        <span class="rf-pill {tier_cls}">{esc(tier_label)}</span>
+                        {status_pill}
                     </div>
-                    <div class="rf-card-title">{esc(cand["title"])}</div>
+                    <div class="rf-item-title">{esc(cand["title"])}</div>
                 </div>
-                <div class="match-score-box">
-                    <div class="match-score-number">{result.final_score:.1f}<span style="font-size:0.95rem;color:#64748B;">/100</span></div>
-                    <div class="match-score-sub">Similarity Score</div>
-                </div>
-            </div>
-
-            <div class="overall-bar-wrap">
-                <div class="overall-bar-meta">
-                    <span><strong>Weighted Similarity Index</strong> (Cosine: {result.raw_cosine_similarity:.3f})</span>
-                    <span>{sem_pts:.1f} + {cat_pts:.1f} + {loc_pts:.1f} + {date_pts:.1f} = <strong>{result.final_score:.1f} / 100</strong></span>
-                </div>
-                <div class="overall-bar-track">
-                    <div class="overall-bar-fill {bar_accent}" style="width:{overall_pct:.1f}%;"></div>
+                <div class="rf-score-block">
+                    <div class="rf-score-value">{result.final_score:.1f}<span> / 100</span></div>
+                    <div class="rf-score-caption">Similarity score</div>
                 </div>
             </div>
 
-            <p class="rf-card-desc">{esc(cand["description"])}</p>
-
-            <div class="rf-meta-row">
-                <span class="rf-meta-item"><strong>Category:</strong> {esc(cand["category"])}</span>
-                <span class="rf-meta-item"><strong>Location:</strong> {esc(cand["location"])}</span>
-                <span class="rf-meta-item"><strong>Date:</strong> {esc(format_display_date(cand["report_date"]))} ({esc(days_label)})</span>
-                <span class="rf-meta-item"><strong>Reference:</strong> {esc(cand.get("contact_label") or "Campus Desk")}</span>
+            <div class="rf-bar-track" role="progressbar" aria-label="Overall similarity score"
+                 aria-valuenow="{overall_pct:.0f}" aria-valuemin="0" aria-valuemax="100">
+                <div class="rf-bar-fill {bar_cls}" style="width:{overall_pct:.1f}%;"></div>
             </div>
 
-            <div class="signal-grid">
-                <div class="signal-box">
-                    <div class="signal-label"><span>Semantic Similarity</span><span>{sem_pct}%</span></div>
-                    <div class="signal-contrib">+{sem_pts:.1f} <span>/ {max_sem:.0f} pts</span></div>
-                    <div class="signal-bar-track"><div class="signal-bar-fill {sem_bar_cls}" style="width:{sem_pct}%;"></div></div>
-                </div>
-                <div class="signal-box">
-                    <div class="signal-label"><span>Category Match</span><span>{cat_pct}%</span></div>
-                    <div class="signal-contrib">+{cat_pts:.1f} <span>/ {max_cat:.0f} pts</span></div>
-                    <div class="signal-bar-track"><div class="signal-bar-fill {cat_bar_cls}" style="width:{cat_pct}%;"></div></div>
-                </div>
-                <div class="signal-box">
-                    <div class="signal-label"><span>Location Match</span><span>{loc_pct}%</span></div>
-                    <div class="signal-contrib">+{loc_pts:.1f} <span>/ {max_loc:.0f} pts</span></div>
-                    <div class="signal-bar-track"><div class="signal-bar-fill {loc_bar_cls}" style="width:{loc_pct}%;"></div></div>
-                </div>
-                <div class="signal-box">
-                    <div class="signal-label"><span>Date Proximity</span><span>{date_pct}%</span></div>
-                    <div class="signal-contrib">+{date_pts:.1f} <span>/ {max_date:.0f} pts</span></div>
-                    <div class="signal-bar-track"><div class="signal-bar-fill {date_bar_cls}" style="width:{date_pct}%;"></div></div>
-                </div>
-            </div>
-
-            <div class="xai-box">
-                <div class="xai-title">Explainable AI Rationale</div>
+            <div class="rf-match-rationale {rationale_cls}">
                 {esc(result.explanation)}
-                <div class="xai-footnote">
-                    Similarity score ({result.final_score:.1f}/100) reflects weighted vector &amp; contextual closeness — not a statistical probability of item identity.
-                </div>
             </div>
-        </div>
-        """,
-        unsafe_allow_html=True,
-    )
 
-    img_path = resolve_image_path(cand.get("image_path"))
-    if img_path is not None:
-        with st.expander(f"View uploaded photo for Report #{cand['id']}"):
-            st.image(str(img_path), width=320)
+            {comparison_chips_html}
 
-    if allow_recovery_actions and source_report.get("id") and cand.get("status") == "active":
-        col_a, col_b, _ = st.columns([1.45, 1.45, 2.1])
-        with col_a:
-            if source_report.get("status") == "active":
-                if st.button(
-                    "Mark Pair as Recovered",
-                    key=f"{key_prefix}_recover_pair_{cand['id']}",
-                    type="primary",
-                    width="stretch",
-                ):
-                    try:
-                        update_report_status(int(source_report["id"]), "recovered")
-                        update_report_status(int(cand["id"]), "recovered")
-                        st.toast(
-                            f"Reports #{source_report['id']} and #{cand['id']} marked as recovered."
-                        )
+            <p class="rf-item-desc">{esc(cand["description"])}</p>
+            {meta_html}
+            """,
+            unsafe_allow_html=True,
+        )
+
+        with st.expander(
+            "Score breakdown & technical details",
+            expanded=expand_breakdown_default,
+        ):
+            render_score_breakdown_grid(result, config)
+
+        img_path = resolve_image_path(cand.get("image_path"))
+        if img_path is not None:
+            with st.expander(f"View uploaded photo — Report #{cand_id}"):
+                st.image(str(img_path), width=320)
+
+        # Deliberate two-step recovery confirmation inside the card
+        if allow_recovery_actions and src_id is not None and status == "active":
+            confirm_key = f"confirm_recover_{key_prefix}_{cand_id}"
+            pending_mode = st.session_state.get(confirm_key)
+
+            if pending_mode == "pair":
+                st.warning(
+                    f"**Confirm recovery:** Mark both **Report #{src_id} ({source_report['title']})** "
+                    f"and **Report #{cand_id} ({cand['title']})** as recovered? "
+                    "Please verify ownership details before closing both cases."
+                )
+                rc1, rc2, _ = st.columns([1.3, 1.0, 2.2])
+                with rc1:
+                    if st.button(
+                        "Confirm Pair Recovery",
+                        key=f"{key_prefix}_confirm_pair_{cand_id}",
+                        type="primary",
+                        width="stretch",
+                    ):
+                        try:
+                            update_report_status(src_id, "recovered")
+                            update_report_status(cand_id, "recovered")
+                        except (sqlite3.Error, ValueError) as exc:
+                            st.error(f"Could not update recovery status: {exc}")
+                        else:
+                            st.session_state.pop(confirm_key, None)
+                            st.session_state["match_flash_success"] = (
+                                f"Marked Reports **#{src_id}** and **#{cand_id}** as recovered."
+                            )
+                            st.rerun()
+                with rc2:
+                    if st.button(
+                        "Cancel",
+                        key=f"{key_prefix}_cancel_pair_{cand_id}",
+                        width="stretch",
+                    ):
+                        st.session_state.pop(confirm_key, None)
                         st.rerun()
-                    except (sqlite3.Error, ValueError) as exc:
-                        st.error(f"Could not update recovery status: {exc}")
-        with col_b:
-            if st.button(
-                f"Mark #{cand['id']} Recovered",
-                key=f"{key_prefix}_recover_cand_{cand['id']}",
-                width="stretch",
-            ):
-                try:
-                    update_report_status(int(cand["id"]), "recovered")
-                    st.toast(f"Report #{cand['id']} marked as recovered.")
-                    st.rerun()
-                except (sqlite3.Error, ValueError) as exc:
-                    st.error(f"Could not update recovery status: {exc}")
+            elif pending_mode == "single":
+                st.warning(
+                    f"**Confirm recovery:** Mark **Report #{cand_id} ({cand['title']})** as recovered?"
+                )
+                rc1, rc2, _ = st.columns([1.3, 1.0, 2.2])
+                with rc1:
+                    if st.button(
+                        f"Confirm #{cand_id} Recovered",
+                        key=f"{key_prefix}_confirm_single_{cand_id}",
+                        type="primary",
+                        width="stretch",
+                    ):
+                        try:
+                            update_report_status(cand_id, "recovered")
+                        except (sqlite3.Error, ValueError) as exc:
+                            st.error(f"Could not update recovery status: {exc}")
+                        else:
+                            st.session_state.pop(confirm_key, None)
+                            st.session_state["match_flash_success"] = (
+                                f"Marked Report **#{cand_id}** as recovered."
+                            )
+                            st.rerun()
+                with rc2:
+                    if st.button(
+                        "Cancel",
+                        key=f"{key_prefix}_cancel_single_{cand_id}",
+                        width="stretch",
+                    ):
+                        st.session_state.pop(confirm_key, None)
+                        st.rerun()
+            else:
+                ac1, ac2, _ = st.columns([1.5, 1.35, 1.65])
+                with ac1:
+                    if source_report.get("status") == "active":
+                        if st.button(
+                            "Mark Pair as Recovered",
+                            key=f"{key_prefix}_recover_pair_{cand_id}",
+                            type="primary",
+                            width="stretch",
+                        ):
+                            st.session_state[confirm_key] = "pair"
+                            st.rerun()
+                with ac2:
+                    if st.button(
+                        f"Mark #{cand_id} Recovered",
+                        key=f"{key_prefix}_recover_cand_{cand_id}",
+                        width="stretch",
+                    ):
+                        st.session_state[confirm_key] = "single"
+                        st.rerun()
+
+
+# ---------------------------------------------------------------------------
+# View 1: Action-First Dashboard
+# ---------------------------------------------------------------------------
 
 
 def render_dashboard_page() -> None:
-    """Render the responsive campus overview dashboard."""
-    render_page_header(
-        "ReFind AI Dashboard",
-        "Campus-wide lost & found overview powered by local semantic NLP matching.",
-    )
-
-    stats = get_dashboard_stats()
-    recovery_rate = (
-        round((stats["total_recovered"] / stats["total_reports"]) * 100)
-        if stats["total_reports"] > 0
-        else 0
-    )
-
-    # Responsive CSS Grid ensures all 4 KPI cards fit comfortably with zero horizontal overflow.
-    st.markdown(
-        f"""
-        <div class="kpi-grid">
-            <div class="kpi-card kpi-navy">
-                <div class="kpi-label">Total Lost Items</div>
-                <div class="kpi-value">{stats["total_lost"]}</div>
-                <div class="kpi-caption">{stats["active_lost"]} currently active</div>
-            </div>
-            <div class="kpi-card kpi-slate">
-                <div class="kpi-label">Total Found Items</div>
-                <div class="kpi-value">{stats["total_found"]}</div>
-                <div class="kpi-caption">{stats["active_found"]} currently active</div>
-            </div>
-            <div class="kpi-card kpi-green">
-                <div class="kpi-label">Items Recovered</div>
-                <div class="kpi-value accent-green">{stats["total_recovered"]}</div>
-                <div class="kpi-caption">{recovery_rate}% of all reports resolved</div>
-            </div>
-            <div class="kpi-card kpi-blue">
-                <div class="kpi-label">Active Reports</div>
-                <div class="kpi-value accent-blue">{stats["active_reports"]}</div>
-                <div class="kpi-caption">Open for AI semantic matching</div>
-            </div>
-        </div>
-        """,
-        unsafe_allow_html=True,
-    )
-
-    st.markdown('<div class="section-heading">Quick Actions</div>', unsafe_allow_html=True)
-    qa1, qa2, qa3 = st.columns(3, gap="small")
-    with qa1:
-        if st.button("Report a Lost Item", type="primary", width="stretch"):
-            navigate_to("Report Lost Item")
-    with qa2:
-        if st.button("Report a Found Item", width="stretch"):
-            navigate_to("Report Found Item")
-    with qa3:
-        if st.button("Open AI Matching Dashboard", width="stretch"):
-            navigate_to("AI Matching")
-
-    st.divider()
-
-    left_col, right_col = st.columns([1.3, 1.0], gap="large")
-
-    with left_col:
-        st.markdown('<div class="section-heading">Recent Campus Reports</div>', unsafe_allow_html=True)
-        recent = get_all_reports(limit=6)
-        if not recent:
-            st.info("No reports recorded yet. Use the buttons above to submit a lost or found report.")
-        else:
-            for item in recent:
-                st.markdown(render_report_card_html(item, compact=True), unsafe_allow_html=True)
-                if item["status"] == "active":
-                    if st.button(
-                        f"Find AI Matches for #{item['id']}",
-                        key=f"dash_match_{item['id']}",
-                    ):
-                        navigate_to("AI Matching", report_id=int(item["id"]))
-
-    with right_col:
+    """Render the redesigned action-first campus dashboard."""
+    # SECTION A — HERO / PRIMARY ACTIONS
+    with st.container(border=True):
         st.markdown(
-            '<div class="section-heading">Top AI Match Highlights</div>',
+            """
+            <div class="rf-eyebrow">Campus Lost &amp; Found Intelligence</div>
+            <h1 class="rf-hero-title">Lost something on campus?</h1>
+            <p class="rf-hero-sub">
+                Report a lost item or help someone recover theirs. ReFind AI uses local
+                semantic NLP to surface meaningful connections across campus reports — even
+                when descriptions use different words.
+            </p>
+            """,
             unsafe_allow_html=True,
         )
-        st.caption(
-            "Strongest active Lost ↔ Found pairs discovered by `all-MiniLM-L6-v2` (similarity scores, not probabilities)."
+        hc1, hc2, hc3, _ = st.columns([1.3, 1.3, 1.15, 1.25], gap="small")
+        with hc1:
+            if st.button(
+                "Report Lost Item",
+                key="hero_report_lost",
+                type="primary",
+                width="stretch",
+            ):
+                navigate_to("Report Lost Item")
+        with hc2:
+            if st.button(
+                "Report Found Item",
+                key="hero_report_found",
+                width="stretch",
+            ):
+                navigate_to("Report Found Item")
+        with hc3:
+            if st.button(
+                "Browse Reports",
+                key="hero_browse",
+                width="stretch",
+            ):
+                navigate_to("Browse Reports")
+
+    # SECTION B — COMPACT CAMPUS ACTIVITY SUMMARY RIBBON
+    stats = get_dashboard_stats()
+    render_metric_ribbon(stats)
+
+    # SECTION C & D — AI MATCH OPPORTUNITIES + RECENT CAMPUS ACTIVITY
+    col_matches, col_activity = st.columns([1.15, 1.0], gap="large")
+
+    with col_matches:
+        render_section_label(
+            "AI Match Opportunities",
+            "Active Lost and Found pairs ranked by semantic and contextual similarity.",
         )
+
         active_lost = get_all_reports(report_type="lost", status="active")
         active_found = get_all_reports(report_type="found", status="active")
 
         if not active_lost or not active_found:
-            st.info("Submit at least one active Lost report and one active Found report to see AI match highlights.")
+            render_empty_state(
+                "Waiting for Opposite-Type Reports",
+                "Submit at least one active Lost report and one active Found report to scan for semantic matches.",
+            )
         else:
-            engine = try_get_engine()
-            if engine is not None:
-                default_cfg = MatchConfig(min_score_threshold=45.0, max_results=1)
-                highlights: list[tuple[dict[str, Any], MatchResult]] = []
-                for lost_item in active_lost:
-                    matches = find_matches(
-                        lost_item, active_found, engine, config=default_cfg
+            engine_state = get_engine_state()
+            if engine_state.status == "not_initialized":
+                with st.container(border=True):
+                    st.markdown(
+                        """
+                        <div class="rf-item-title" style="margin-bottom:0.3rem;">
+                            Scan active campus reports with AI
+                        </div>
+                        <p class="rf-item-desc" style="margin-bottom:0.75rem;">
+                            To keep the Dashboard fast on startup, the local
+                            <code>all-MiniLM-L6-v2</code> model loads on demand. Click below to
+                            initialize the AI engine and discover top matching pairs.
+                        </p>
+                        """,
+                        unsafe_allow_html=True,
                     )
-                    if matches:
-                        highlights.append((lost_item, matches[0]))
-
-                highlights.sort(key=lambda pair: pair[1].final_score, reverse=True)
-                top_highlights = highlights[:4]
-
+                    lc1, lc2 = st.columns([1.45, 1.0], gap="small")
+                    with lc1:
+                        if st.button(
+                            "Load AI & Scan Matches",
+                            key="dash_load_ai_highlights",
+                            type="primary",
+                            width="stretch",
+                        ):
+                            if try_get_engine() is not None:
+                                st.rerun()
+                    with lc2:
+                        if st.button(
+                            "Open AI Matching",
+                            key="dash_open_ai_matching",
+                            width="stretch",
+                        ):
+                            navigate_to("AI Matching")
+            elif engine_state.status == "unavailable":
+                st.error(
+                    f"AI Engine is currently unavailable: {engine_state.error_message or 'Model failed to load.'}"
+                )
+                if st.button(
+                    "Retry AI Engine Load",
+                    key="dash_retry_ai_highlights",
+                    width="stretch",
+                ):
+                    if try_get_engine(force_retry=True) is not None:
+                        st.rerun()
+            elif engine_state.engine is not None:
+                top_highlights = get_cached_dashboard_highlights(engine_state.engine)
                 if not top_highlights:
-                    st.info("No active pairs currently cross the 45.0 similarity highlight threshold.")
+                    render_empty_state(
+                        "No Strong Active Pairs Yet",
+                        "No active Lost ↔ Found pairs currently score above 45.0 / 100. Open AI Matching to inspect lower-threshold candidates.",
+                    )
                 else:
-                    for lost_item, best_match in top_highlights:
+                    for lost_item, best_match in top_highlights[:3]:
                         cand = best_match.candidate
-                        tier_label, tier_cls = score_tier(best_match.final_score)
-                        bar_cls = "strong" if best_match.final_score >= 75.0 else ""
-                        st.markdown(
-                            f"""
-                            <div class="rf-card" style="border-left: 3px solid {'#16A34A' if best_match.final_score >= 75.0 else '#2563EB'};">
-                                <div class="rf-card-header">
-                                    <span class="rf-badge {tier_cls}">{best_match.final_score:.1f}/100 &middot; {esc(tier_label)}</span>
-                                    <span style="font-size:0.78rem;color:#64748B;">Semantic: {round(best_match.semantic_score*100)}%</span>
+                        tier_label, tier_cls = match_tier_display(best_match.final_score)
+                        bar_cls = "fill-strong" if best_match.final_score >= 75.0 else ""
+                        short_why = _concise_explanation(best_match.explanation)
+
+                        with st.container(border=True):
+                            st.markdown(
+                                f"""
+                                <div class="rf-activity-row-top">
+                                    <span class="rf-pill {tier_cls}">{best_match.final_score:.1f} / 100 &middot; {esc(tier_label)}</span>
+                                    <span style="font-size:0.76rem;color:#64748B;">Semantic {round(best_match.semantic_score*100)}%</span>
                                 </div>
-                                <div class="overall-bar-track" style="height:6px; margin:0.35rem 0 0.55rem 0;">
-                                    <div class="overall-bar-fill {bar_cls}" style="width:{best_match.final_score:.1f}%;"></div>
+                                <div class="rf-bar-track" style="height:5px; margin:0.45rem 0 0.5rem 0;"
+                                     role="progressbar" aria-label="Match similarity score"
+                                     aria-valuenow="{best_match.final_score:.0f}" aria-valuemin="0" aria-valuemax="100">
+                                    <div class="rf-bar-fill {bar_cls}" style="width:{best_match.final_score:.1f}%;"></div>
                                 </div>
-                                <div style="font-size:0.89rem;line-height:1.45;">
+                                <div class="rf-highlight-pair">
                                     <strong>Lost #{int(lost_item["id"])}:</strong> {esc(lost_item["title"])}<br/>
                                     <strong>Found #{int(cand["id"])}:</strong> {esc(cand["title"])}
                                 </div>
-                                <div style="font-size:0.79rem;color:#475569;margin-top:0.4rem;line-height:1.45;">
-                                    {esc(best_match.explanation)}
-                                </div>
+                                <div class="rf-highlight-why">{esc(short_why)}</div>
+                                """,
+                                unsafe_allow_html=True,
+                            )
+                            if st.button(
+                                "Review Match",
+                                key=f"highlight_open_{lost_item['id']}",
+                                width="stretch",
+                            ):
+                                navigate_to("AI Matching", report_id=int(lost_item["id"]))
+
+    with col_activity:
+        render_section_label(
+            "Recent Campus Activity",
+            "Latest reported lost and found items across campus.",
+        )
+
+        recent = get_all_reports(limit=5)
+        if not recent:
+            render_empty_state(
+                "No Campus Reports Yet",
+                "Use Report Lost Item or Report Found Item above to record the first item.",
+            )
+        else:
+            for item in recent:
+                item_id = int(item["id"])
+                badges = build_report_badges_html(
+                    item["report_type"], item["status"], show_active_badge=False
+                )
+                rel_date = format_relative_date(item.get("report_date"))
+
+                with st.container(border=True):
+                    c_info, c_act = st.columns([2.2, 0.95], vertical_alignment="center")
+                    with c_info:
+                        st.markdown(
+                            f"""
+                            <div class="rf-activity-row-top">
+                                <span class="rf-item-title" style="font-size:0.93rem;">
+                                    <span class="rf-id-tag">#{item_id}</span> {esc(item["title"])}
+                                </span>
+                            </div>
+                            <div class="rf-pill-row" style="margin-top:0.3rem;">
+                                {badges}
+                            </div>
+                            <div class="rf-activity-meta">
+                                {esc(item["location"])} &middot; {esc(rel_date)}
                             </div>
                             """,
                             unsafe_allow_html=True,
                         )
-                        if st.button(
-                            f"Inspect Match for #{lost_item['id']}",
-                            key=f"highlight_open_{lost_item['id']}",
-                            width="stretch",
-                        ):
-                            navigate_to("AI Matching", report_id=int(lost_item["id"]))
+                    with c_act:
+                        if item["status"] == "active":
+                            if st.button(
+                                "Match",
+                                key=f"dash_match_{item_id}",
+                                width="stretch",
+                            ):
+                                navigate_to("AI Matching", report_id=item_id)
+                        else:
+                            if st.button(
+                                "View",
+                                key=f"dash_view_{item_id}",
+                                width="stretch",
+                            ):
+                                navigate_to("Browse Reports")
+
+
+# ---------------------------------------------------------------------------
+# View 2: AI Matching — Split Comparison Workspace
+# ---------------------------------------------------------------------------
+
+
+def _reset_matching_weights() -> None:
+    """Callback to restore the default 70/15/10/5 academic weights & threshold."""
+    st.session_state["ai_w_sem"] = 70
+    st.session_state["ai_w_cat"] = 15
+    st.session_state["ai_w_loc"] = 10
+    st.session_state["ai_w_date"] = 5
+    st.session_state["ai_min_threshold"] = 35
+    st.session_state["ai_show_below"] = False
+    st.session_state["ai_include_rec_cand"] = False
 
 
 def render_ai_matching_page() -> None:
-    """Render the dedicated AI Semantic Matching & Academic Demonstration Dashboard."""
-    render_page_header(
-        "AI Semantic Matching Engine",
-        "Natural-language item matching powered by sentence-transformers/all-MiniLM-L6-v2 and explainable hybrid scoring.",
-    )
-
-    # Academic workflow overview strip
-    st.markdown(
-        """
-        <div class="workflow-grid">
-            <div class="workflow-step">
-                <div class="workflow-num">Step 1</div>
-                <div class="workflow-title">Text Preprocessing</div>
-                <div class="workflow-desc">Combines title, description, and notes into clean natural language while filtering to opposite report types.</div>
-            </div>
-            <div class="workflow-step">
-                <div class="workflow-num">Step 2</div>
-                <div class="workflow-title">Sentence Embeddings</div>
-                <div class="workflow-desc">Encodes text into 384-D semantic vectors using local <code>all-MiniLM-L6-v2</code> so synonyms sit close together.</div>
-            </div>
-            <div class="workflow-step">
-                <div class="workflow-num">Step 3</div>
-                <div class="workflow-title">Cosine Similarity</div>
-                <div class="workflow-desc">Measures angular vector closeness via Scikit-learn, independent of exact keyword overlap.</div>
-            </div>
-            <div class="workflow-step">
-                <div class="workflow-num">Step 4</div>
-                <div class="workflow-title">Hybrid Fusion &amp; XAI</div>
-                <div class="workflow-desc">Combines Semantic (70%), Category (15%), Location (10%), and Date (5%) with evidence-grounded explanations.</div>
-            </div>
-        </div>
-        """,
-        unsafe_allow_html=True,
-    )
-
-    with st.expander("How Sentence Embeddings & Cosine Similarity Work (Academic Reference)", expanded=False):
-        st.markdown(
-            """
-            - **Why Not Keyword Search?** A student may report *"blue water bottle"* while a finder logs *"navy reusable drinking bottle"*. Exact keyword matching misses synonymy and paraphrasing.
-            - **Sentence Embeddings (`all-MiniLM-L6-v2`):** A 6-layer MiniLM transformer trained via contrastive Siamese learning maps each item description into a 384-dimensional vector $\\mathbf{v} \\in \\mathbb{R}^{384}$ representing semantic meaning.
-            - **Cosine Similarity:** Measures the cosine of the angle between two embedding vectors:
-              $$\\cos(\\theta) = \\frac{\\mathbf{u} \\cdot \\mathbf{v}}{\\|\\mathbf{u}\\|_2 \\|\\mathbf{v}\\|_2}$$
-              Values are clamped to $[0, 1]$ for weighted scoring, where higher values indicate closer semantic alignment.
-            - **Hybrid Scoring Formula (0–100):**
-              $$\\text{Final Score} = 100 \\times (0.70 \\cdot S_{\\text{sem}} + 0.15 \\cdot S_{\\text{cat}} + 0.10 \\cdot S_{\\text{loc}} + 0.05 \\cdot S_{\\text{date}})$$
-            - **Similarity Score vs. Probability:** A score of **82.4 / 100** indicates strong relative similarity across semantic and contextual signals — it does **not** represent an 82.4% probability that two reports describe the identical physical object.
-            """
+    """Render the centrepiece split-comparison AI Matching workspace."""
+    # Compact header with unobtrusive How AI Works & Scoring Settings popovers
+    hdr_left, hdr_right = st.columns([2.4, 1.3], vertical_alignment="bottom")
+    with hdr_left:
+        render_page_header(
+            "AI Matching",
+            "Discover potential connections between lost and found reports using semantic AI.",
         )
+    with hdr_right:
+        p1, p2 = st.columns(2, gap="small")
+        with p1:
+            with st.popover("How AI Works", width="stretch"):
+                render_how_ai_works_content()
+        with p2:
+            with st.popover("Scoring Settings", width="stretch"):
+                st.caption(
+                    "Default formula: 70% Semantic, 15% Category, 10% Location, 5% Date. "
+                    "Weights normalize automatically to 100%."
+                )
+                raw_sem = st.slider("Semantic Weight", 0, 100, 70, step=5, key="ai_w_sem")
+                raw_cat = st.slider("Category Weight", 0, 100, 15, step=5, key="ai_w_cat")
+                raw_loc = st.slider("Location Weight", 0, 100, 10, step=5, key="ai_w_loc")
+                raw_date = st.slider("Date Weight", 0, 100, 5, step=5, key="ai_w_date")
+                min_threshold = st.slider(
+                    "Minimum Display Score",
+                    min_value=0,
+                    max_value=85,
+                    value=35,
+                    step=5,
+                    key="ai_min_threshold",
+                )
+                show_below_threshold = st.checkbox(
+                    "Show candidates below threshold",
+                    value=False,
+                    key="ai_show_below",
+                )
+                include_recovered_candidates = st.checkbox(
+                    "Include recovered items in candidates",
+                    value=False,
+                    key="ai_include_rec_cand",
+                )
+                st.button(
+                    "Reset Default Weights",
+                    key="ai_reset_weights",
+                    on_click=_reset_matching_weights,
+                    width="stretch",
+                )
 
-    st.markdown(
-        """
-        <div class="academic-note">
-            <strong>Important Evaluation Note:</strong> ReFind AI scores (0–100) represent a
-            <strong>weighted similarity index</strong>, <strong>not</strong> a statistical probability.
-            Always verify distinguishing details before returning an item.
-        </div>
-        """,
-        unsafe_allow_html=True,
-    )
+    flash_success = st.session_state.pop("match_flash_success", None)
+    if flash_success:
+        st.success(flash_success)
 
     engine = try_get_engine()
     if engine is None:
@@ -535,7 +685,54 @@ def render_ai_matching_page() -> None:
 
     all_reports = get_all_reports()
 
-    # Quick academic demo preset selector when seed reports are present
+    # Source selection bar
+    sel_col, tog_col = st.columns([2.5, 1.0], vertical_alignment="bottom")
+    with tog_col:
+        include_recovered_source = st.checkbox(
+            "Include recovered reports",
+            value=False,
+            key="ai_include_rec_source",
+        )
+
+    source_pool = (
+        all_reports
+        if include_recovered_source
+        else [r for r in all_reports if r["status"] == "active"]
+    )
+    if not source_pool:
+        render_empty_state(
+            "No Reports Available for Matching",
+            "Submit a Lost or Found report first, or enable 'Include recovered reports' above.",
+        )
+        return
+
+    report_by_id = {int(r["id"]): r for r in source_pool}
+    option_ids = [int(r["id"]) for r in source_pool]
+
+    # V1.2 one-time pending navigation selection (never overwrites user dropdown choices!)
+    pending_id = st.session_state.pop("pending_match_report_id", None)
+    if pending_id is not None and int(pending_id) in report_by_id:
+        st.session_state["ai_match_select_id"] = int(pending_id)
+    elif st.session_state.get("ai_match_select_id") not in report_by_id:
+        st.session_state["ai_match_select_id"] = option_ids[0]
+
+    def _format_id_option(rep_id: int) -> str:
+        rep = report_by_id[int(rep_id)]
+        return (
+            f"[{rep['report_type'].upper()} #{rep['id']}] {rep['title']} "
+            f"— {rep['location']} ({format_relative_date(rep['report_date'])})"
+        )
+
+    with sel_col:
+        selected_id = st.selectbox(
+            "Selected report to match",
+            options=option_ids,
+            format_func=_format_id_option,
+            key="ai_match_select_id",
+        )
+    selected_report = report_by_id[int(selected_id)]
+
+    # Compact Academic Demo Presets (preserved for viva walkthrough)
     seed_lookup = {
         str(r["seed_key"]): int(r["id"])
         for r in all_reports
@@ -547,93 +744,24 @@ def render_ai_matching_page() -> None:
         if key in seed_lookup
     ]
     if available_presets:
-        st.caption("Quick Academic Demo Cases (click to inspect realistic sample reports):")
+        st.caption("Quick sample cases:")
         preset_cols = st.columns(len(available_presets), gap="small")
         for col, (label, rep_id) in zip(preset_cols, available_presets):
             with col:
                 if st.button(label, key=f"demo_preset_{rep_id}", width="stretch"):
-                    st.session_state["selected_match_report_id"] = rep_id
-                    st.session_state["ai_match_select_id"] = rep_id
+                    st.session_state["pending_match_report_id"] = rep_id
                     st.rerun()
 
-    include_recovered_source = st.checkbox(
-        "Include already-recovered reports in source selector",
-        value=False,
-    )
-    source_pool = (
-        all_reports
-        if include_recovered_source
-        else [r for r in all_reports if r["status"] == "active"]
-    )
-
-    if not source_pool:
-        st.info("No reports available for matching. Submit a Lost or Found report first.")
-        return
-
-    report_by_id = {int(r["id"]): r for r in source_pool}
-    option_ids = [int(r["id"]) for r in source_pool]
-
-    # Deterministically synchronize integer report ID selection across navigation and reruns.
-    requested_id = st.session_state.get("selected_match_report_id")
-    if requested_id in report_by_id:
-        st.session_state["ai_match_select_id"] = int(requested_id)
-    elif st.session_state.get("ai_match_select_id") not in report_by_id:
-        st.session_state["ai_match_select_id"] = option_ids[0]
-
-    def _format_id_option(rep_id: int) -> str:
-        rep = report_by_id[int(rep_id)]
-        return (
-            f"[{rep['report_type'].upper()} #{rep['id']}] {rep['title']} "
-            f"— {rep['location']} ({format_display_date(rep['report_date'])})"
-        )
-
-    selected_id = st.selectbox(
-        "Select a report to analyze with ReFind AI:",
-        options=option_ids,
-        format_func=_format_id_option,
-        key="ai_match_select_id",
-    )
-    st.session_state["selected_match_report_id"] = int(selected_id)
-    selected_report = report_by_id[int(selected_id)]
-
-    # Configurable algorithm weights & threshold
-    with st.expander("Configure Hybrid Scoring Weights & Threshold", expanded=False):
-        st.caption(
-            "Default formula: 70% Semantic + 15% Category + 10% Location + 5% Date Proximity. "
-            "Adjust sliders to test sensitivity; weights normalize automatically to 100%."
-        )
-        wc1, wc2, wc3, wc4 = st.columns(4)
-        raw_sem = wc1.slider("Semantic Weight", 0, 100, 70, step=5)
-        raw_cat = wc2.slider("Category Weight", 0, 100, 15, step=5)
-        raw_loc = wc3.slider("Location Weight", 0, 100, 10, step=5)
-        raw_date = wc4.slider("Date Weight", 0, 100, 5, step=5)
-
-        total_raw = raw_sem + raw_cat + raw_loc + raw_date
-        if total_raw == 0:
-            w_sem, w_cat, w_loc, w_date = 0.70, 0.15, 0.10, 0.05
-            st.warning("All weights were 0; reverted to default 70/15/10/5 weights.")
-        else:
-            w_sem = raw_sem / total_raw
-            w_cat = raw_cat / total_raw
-            w_loc = raw_loc / total_raw
-            w_date = raw_date / total_raw
-
-        tc1, tc2 = st.columns([2, 1.5])
-        min_threshold = tc1.slider(
-            "Minimum Display Score (0–100)",
-            min_value=0,
-            max_value=85,
-            value=35,
-            step=5,
-        )
-        show_below_threshold = tc2.checkbox(
-            "Show all opposite-type candidates (ignore threshold)",
-            value=False,
-        )
-        include_recovered_candidates = st.checkbox(
-            "Include recovered items in candidate pool",
-            value=False,
-        )
+    # Build normalized MatchConfig from settings popover
+    total_raw = raw_sem + raw_cat + raw_loc + raw_date
+    if total_raw == 0:
+        w_sem, w_cat, w_loc, w_date = 0.70, 0.15, 0.10, 0.05
+        st.warning("All weights were 0; reverted to default 70/15/10/5 weights.")
+    else:
+        w_sem = raw_sem / total_raw
+        w_cat = raw_cat / total_raw
+        w_loc = raw_loc / total_raw
+        w_date = raw_date / total_raw
 
     config = MatchConfig(
         weight_semantic=w_sem,
@@ -644,15 +772,7 @@ def render_ai_matching_page() -> None:
         max_results=10,
     )
 
-    st.markdown('<div class="section-heading">Selected Source Report</div>', unsafe_allow_html=True)
-    st.markdown(render_report_card_html(selected_report, compact=False), unsafe_allow_html=True)
-
-    source_img = resolve_image_path(selected_report.get("image_path"))
-    if source_img is not None:
-        with st.expander("View uploaded photo for selected report"):
-            st.image(str(source_img), width=320)
-
-    opposite_label = "FOUND" if selected_report["report_type"] == "lost" else "LOST"
+    opposite_label = "Found" if selected_report["report_type"] == "lost" else "Lost"
     matches = find_matches(
         source_report=selected_report,
         candidate_reports=all_reports,
@@ -662,29 +782,60 @@ def render_ai_matching_page() -> None:
         apply_threshold=not show_below_threshold,
     )
 
-    st.markdown(
-        f'<div class="section-heading">Ranked AI Recommendations ({opposite_label} Reports)</div>',
-        unsafe_allow_html=True,
-    )
+    st.divider()
 
-    if not matches:
-        st.info(
-            f"No {opposite_label.lower()} reports scored at or above {min_threshold:.0f}/100. "
-            "You can lower the threshold or toggle 'Show all opposite-type candidates' above to inspect lower-ranked comparisons."
+    # SPLIT COMPARISON WORKSPACE (Left: Source Item | Right: Ranked AI Candidates)
+    col_source, col_candidates = st.columns([0.92, 1.48], gap="large")
+
+    with col_source:
+        render_section_label(
+            "Selected Source Report",
+            f"Comparing against active {opposite_label.lower()} campus reports.",
         )
-    else:
-        st.caption(
-            f"Showing {len(matches)} ranked {opposite_label.lower()} candidate(s) evaluated with "
-            f"`{engine.model_name}` ({engine.embedding_dim}-D embeddings, Scikit-learn cosine similarity)."
+        with st.container(border=True):
+            render_report_body(selected_report, compact=False, show_contact=True)
+            source_img = resolve_image_path(selected_report.get("image_path"))
+            if source_img is not None:
+                with st.expander("View uploaded photo"):
+                    st.image(str(source_img), width=280)
+
+        st.markdown(
+            """
+            <div class="rf-prob-footnote" style="margin-top:0.65rem;">
+                <strong>Human verification required:</strong> Semantic similarity can surface
+                similar-looking items of different brands or owners. Compare location, date,
+                and distinguishing marks before confirming recovery.
+            </div>
+            """,
+            unsafe_allow_html=True,
         )
-        for rank, result in enumerate(matches, start=1):
-            render_match_result_card(
-                rank=rank,
-                result=result,
-                source_report=selected_report,
-                config=config,
-                key_prefix=f"matcher_{selected_report['id']}_{rank}",
+
+    with col_candidates:
+        render_section_label(
+            f"Ranked {opposite_label} Candidates ({len(matches)})",
+            f"Evaluated with {engine.model_name.split('/')[-1]} ({engine.embedding_dim}-D cosine similarity + context).",
+        )
+
+        if not matches:
+            render_empty_state(
+                f"No {opposite_label} Candidates Above {min_threshold:.0f} / 100",
+                "Lower the minimum threshold or enable 'Show candidates below threshold' inside Scoring Settings to inspect lower-ranked comparisons.",
             )
+        else:
+            for rank, result in enumerate(matches, start=1):
+                render_integrated_match_card(
+                    rank=rank,
+                    result=result,
+                    source_report=selected_report,
+                    config=config,
+                    key_prefix=f"matcher_{selected_report['id']}_{rank}",
+                    expand_breakdown_default=(rank == 1),
+                )
+
+
+# ---------------------------------------------------------------------------
+# Views 3 & 4: Guided Report Lost Item & Report Found Item
+# ---------------------------------------------------------------------------
 
 
 def _init_form_state(report_type: str, force_reset: bool = False) -> None:
@@ -693,6 +844,7 @@ def _init_form_state(report_type: str, force_reset: bool = False) -> None:
         f"{report_type}_title": "",
         f"{report_type}_category": CATEGORIES[0],
         f"{report_type}_description": "",
+        f"{report_type}_location_preset": CUSTOM_LOCATION_OPTION,
         f"{report_type}_location": "",
         f"{report_type}_date": date.today(),
         f"{report_type}_extra": "",
@@ -709,64 +861,48 @@ def _init_form_state(report_type: str, force_reset: bool = False) -> None:
         st.session_state[nonce_key] = int(st.session_state[nonce_key]) + 1
 
 
-def render_report_form_page(report_type: str) -> None:
-    """Render either the Report Lost Item or Report Found Item form with reliable state handling."""
-    is_lost = report_type == "lost"
-    page_title = "Report a Lost Item" if is_lost else "Report a Found Item"
-    page_subtitle = (
-        "Describe what you misplaced in natural language. ReFind AI saves your report and immediately checks active found items."
-        if is_lost
-        else "Log an item you found on campus. ReFind AI saves your report and immediately checks active lost reports."
-    )
-    render_page_header(page_title, page_subtitle)
-
-    # Reset form inputs ONLY after a previously verified successful submission.
-    should_reset = bool(st.session_state.pop(f"reset_form_{report_type}", False))
-    _init_form_state(report_type, force_reset=should_reset)
-
-    # Display flash confirmation banner persisted across post-submit rerun.
-    flash_msg = st.session_state.pop(f"flash_success_{report_type}", None)
-    if flash_msg:
-        st.success(flash_msg)
-
+def _render_report_form_widget(report_type: str, is_lost: bool) -> None:
+    """Render the guided 3-section reporting form and process verified submissions."""
     loc_label = "Last Seen Location *" if is_lost else "Location Found *"
     date_label = "Date Lost *" if is_lost else "Date Found *"
     extra_label = (
-        "Additional Identifying Details (Optional)"
+        "Distinguishing Marks or Identifying Details (Optional)"
         if is_lost
-        else "Additional Observations (Optional)"
+        else "Current Custody & Observations (Optional)"
     )
     extra_placeholder = (
-        "E.g., small scratch on back, specific sticker, keychain, or engraving..."
+        "E.g., small dent near base, blue sticker, initials inside flap..."
         if is_lost
-        else "E.g., handed in to security desk, condition of item, notable markings..."
+        else "E.g., handed in to Central Library security desk; minor scratches on back..."
     )
     desc_placeholder = (
-        "E.g., Lost my dark brown leather wallet near the library entrance. Slim bifold style with stitched edges."
+        "E.g., Dark brown leather bifold wallet lost near the library entrance. Slim design with stitched edges."
         if is_lost
-        else "E.g., Found a brown leather purse-like wallet on a bench outside the central library."
+        else "E.g., Brown leather purse-style wallet found on a bench outside the central library."
     )
-
     upload_nonce = int(st.session_state[f"{report_type}_upload_nonce"])
 
-    # clear_on_submit=False and enter_to_submit=False prevent premature Enter-key submits
-    # and preserve user input if any validation error occurs.
     with st.form(
         key=f"form_report_{report_type}",
         clear_on_submit=False,
         enter_to_submit=False,
     ):
-        col1, col2 = st.columns([1.4, 1.0])
-        with col1:
+        # SECTION 1 — ITEM DETAILS
+        st.markdown(
+            '<div class="rf-form-section-title">1. Item Details</div>',
+            unsafe_allow_html=True,
+        )
+        c1, c2 = st.columns([1.45, 1.0])
+        with c1:
             title = st.text_input(
-                "Item Name / Title *",
+                "Item Title *",
                 placeholder="E.g., Dark Brown Leather Wallet",
                 max_chars=120,
                 key=f"{report_type}_title",
             )
-        with col2:
+        with c2:
             category = st.selectbox(
-                "Item Category *",
+                "Category *",
                 options=CATEGORIES,
                 key=f"{report_type}_category",
             )
@@ -775,23 +911,59 @@ def render_report_form_page(report_type: str) -> None:
             "Detailed Description *",
             placeholder=desc_placeholder,
             height=115,
-            help="Include color, material, brand, size, or distinctive features so the NLP model can identify semantic matches.",
             key=f"{report_type}_description",
         )
+        st.markdown(
+            """
+            <div class="rf-field-hint">
+                Include details such as colour, brand, material, size or distinguishing marks.
+                The more descriptive your report, the better AI can identify potential matches.
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
 
-        col3, col4 = st.columns([1.4, 1.0])
-        with col3:
-            location = st.text_input(
-                loc_label,
-                placeholder="E.g., Central Library, Room 204, Main Cafeteria",
-                help="Common campus areas: " + ", ".join(CAMPUS_LOCATION_SUGGESTIONS[:5]),
-                key=f"{report_type}_location",
+        # SECTION 2 — WHERE AND WHEN
+        st.markdown(
+            '<div class="rf-form-section-title">2. Where and When</div>',
+            unsafe_allow_html=True,
+        )
+        c3, c4 = st.columns([1.35, 1.0])
+        with c3:
+            location_preset = st.selectbox(
+                "Common Campus Area (Optional quick-select)",
+                options=[CUSTOM_LOCATION_OPTION, *CAMPUS_LOCATION_SUGGESTIONS],
+                key=f"{report_type}_location_preset",
             )
-        with col4:
+        with c4:
             report_date = st.date_input(
                 date_label,
                 max_value=date.today() + timedelta(days=1),
                 key=f"{report_type}_date",
+            )
+
+        location = st.text_input(
+            loc_label,
+            placeholder="Type exact spot or room (e.g., Central Library Entrance, Room 204)",
+            help="Leave blank only if you selected a Common Campus Area above; typing here overrides the quick-select.",
+            key=f"{report_type}_location",
+        )
+
+        # SECTION 3 — ADDITIONAL DETAILS
+        st.markdown(
+            '<div class="rf-form-section-title">3. Additional Details</div>',
+            unsafe_allow_html=True,
+        )
+        if not is_lost:
+            st.markdown(
+                """
+                <div class="rf-field-hint">
+                    <strong>Finder guidance:</strong> Mention where the item is currently kept
+                    (e.g., turned in to a campus security desk). Avoid posting sensitive ID numbers
+                    or personal phone numbers publicly.
+                </div>
+                """,
+                unsafe_allow_html=True,
             )
 
         additional_details = st.text_input(
@@ -801,15 +973,15 @@ def render_report_form_page(report_type: str) -> None:
             key=f"{report_type}_extra",
         )
 
-        col5, col6 = st.columns([1.2, 1.2])
-        with col5:
+        c5, c6 = st.columns([1.15, 1.25])
+        with c5:
             contact_label = st.text_input(
-                "Campus Desk / Demo Reference (Optional)",
+                "Campus Desk / Reference (Optional)",
                 placeholder="E.g., Library Desk Ref #108 (Demo)",
-                help="For privacy during academic demos, use a synthetic desk reference rather than personal phone numbers or emails.",
+                help="Use a campus desk reference or synthetic contact label rather than private personal data.",
                 key=f"{report_type}_contact",
             )
-        with col6:
+        with c6:
             uploaded_photo = st.file_uploader(
                 "Optional Photograph (PNG, JPG, WEBP)",
                 type=["png", "jpg", "jpeg", "webp"],
@@ -817,7 +989,7 @@ def render_report_form_page(report_type: str) -> None:
             )
 
         submitted = st.form_submit_button(
-            f"Submit {'Lost' if is_lost else 'Found'} Report & Run AI Match",
+            f"Submit {'Lost' if is_lost else 'Found'} Report & Find Matches",
             type="primary",
             width="stretch",
         )
@@ -826,20 +998,27 @@ def render_report_form_page(report_type: str) -> None:
         errors: list[str] = []
         clean_title = (title or "").strip()
         clean_desc = (description or "").strip()
-        clean_loc = (location or "").strip()
+        typed_loc = (location or "").strip()
+        preset_loc = (
+            "" if location_preset == CUSTOM_LOCATION_OPTION else str(location_preset).strip()
+        )
+        effective_loc = typed_loc or preset_loc
 
         if not clean_title:
-            errors.append("Please enter an item name/title.")
+            errors.append("Please enter an item title.")
         if not clean_desc or len(clean_desc) < 5:
             errors.append("Please provide a descriptive summary (at least 5 characters).")
-        if not clean_loc:
-            errors.append("Please enter the campus location.")
+        if not effective_loc:
+            errors.append("Please enter a campus location or choose a common campus area.")
 
-        # Defensively handle date picker returning None or a tuple if cleared.
         valid_date: Optional[date] = None
         if isinstance(report_date, date):
             valid_date = report_date
-        elif isinstance(report_date, (tuple, list)) and report_date and isinstance(report_date[0], date):
+        elif (
+            isinstance(report_date, (tuple, list))
+            and report_date
+            and isinstance(report_date[0], date)
+        ):
             valid_date = report_date[0]
 
         if valid_date is None:
@@ -848,19 +1027,18 @@ def render_report_form_page(report_type: str) -> None:
             errors.append("The selected date cannot be in the future.")
 
         if not errors and valid_date is not None:
-            # Prevent accidental duplicate submissions (e.g., double-click or repeat submit).
             existing_dup = find_duplicate_report(
                 title=clean_title,
                 description=clean_desc,
                 report_type=report_type,
-                location=clean_loc,
+                location=effective_loc,
                 report_date=valid_date.isoformat(),
             )
             if existing_dup is not None:
                 st.session_state[f"last_submitted_{report_type}_id"] = int(existing_dup["id"])
                 st.warning(
                     f"An identical active {report_type} report (**#{existing_dup['id']} — {existing_dup['title']}**) "
-                    "is already saved in the database. Showing its AI match results below without creating a duplicate."
+                    "already exists. Displaying its AI matches without creating a duplicate."
                 )
             else:
                 image_rel_path: Optional[str] = None
@@ -877,7 +1055,7 @@ def render_report_form_page(report_type: str) -> None:
                             description=clean_desc,
                             category=category,
                             report_type=report_type,
-                            location=clean_loc,
+                            location=effective_loc,
                             report_date=valid_date.isoformat(),
                             additional_details=(additional_details or "").strip(),
                             contact_label=(contact_label or "").strip()
@@ -887,11 +1065,10 @@ def render_report_form_page(report_type: str) -> None:
                     except (sqlite3.Error, ValueError) as exc:
                         errors.append(f"Database error while saving report: {exc}")
                     else:
-                        # Sync sidebar counts, clear form cleanly, and show confirmation + AI matches.
                         st.session_state[f"last_submitted_{report_type}_id"] = int(new_id)
                         st.session_state[f"flash_success_{report_type}"] = (
-                            f"Report **#{new_id} ({clean_title})** has been saved to SQLite. "
-                            "Your report is now live on the Dashboard, Browse Reports, and AI Matching below."
+                            f"Report **#{new_id} ({clean_title})** saved to SQLite. "
+                            "Your submission is live across the Dashboard, Browse Reports, and AI Matching."
                         )
                         st.session_state[f"reset_form_{report_type}"] = True
                         st.rerun()
@@ -900,165 +1077,588 @@ def render_report_form_page(report_type: str) -> None:
             for err in errors:
                 st.error(err)
 
-    # Show immediate AI matches for the most recently submitted report on this form.
-    last_id = st.session_state.get(f"last_submitted_{report_type}_id")
-    if last_id is not None:
-        saved_report = get_report_by_id(int(last_id))
-        if saved_report is None:
-            st.session_state.pop(f"last_submitted_{report_type}_id", None)
-        else:
-            st.divider()
-            st.markdown(
-                f'<div class="section-heading">Instant AI Matches for Report #{saved_report["id"]}: {esc(saved_report["title"])}</div>',
-                unsafe_allow_html=True,
+
+def _render_post_submit_results_panel(saved_report: dict[str, Any], report_type: str) -> None:
+    """Render saved report confirmation summary and instant AI matches prominently."""
+    rep_id = int(saved_report["id"])
+    render_section_label(
+        f"Submitted Report #{rep_id} & Instant AI Matches",
+        "Semantic matches against active opposite-type campus reports.",
+    )
+    with st.container(border=True):
+        render_report_body(saved_report, compact=False, show_contact=True)
+        b1, b2, b3 = st.columns([1.25, 1.1, 1.05], gap="small")
+        with b1:
+            if st.button(
+                "Open in AI Matching",
+                key=f"jump_after_submit_{rep_id}",
+                type="primary",
+                width="stretch",
+            ):
+                navigate_to("AI Matching", report_id=rep_id)
+        with b2:
+            if st.button(
+                "View in Browse",
+                key=f"browse_after_submit_{rep_id}",
+                width="stretch",
+            ):
+                navigate_to("Browse Reports")
+        with b3:
+            if st.button(
+                "Report Another",
+                key=f"dismiss_after_submit_{report_type}",
+                width="stretch",
+            ):
+                st.session_state.pop(f"last_submitted_{report_type}_id", None)
+                st.session_state[f"reset_form_{report_type}"] = True
+                st.rerun()
+
+    engine = try_get_engine()
+    if engine is not None:
+        cfg = MatchConfig(max_results=5)
+        candidates = get_all_reports()
+        matches = find_matches(saved_report, candidates, engine, config=cfg)
+        if not matches:
+            render_empty_state(
+                "No Immediate Matches Above 35 / 100",
+                "Your report is saved in SQLite and will automatically appear as a candidate when new opposite-type reports are submitted.",
             )
-            ac1, ac2, _ = st.columns([1.45, 1.35, 1.2])
-            with ac1:
+        else:
+            for idx, res in enumerate(matches, start=1):
+                render_integrated_match_card(
+                    rank=idx,
+                    result=res,
+                    source_report=saved_report,
+                    config=cfg,
+                    key_prefix=f"instant_{rep_id}_{idx}",
+                    expand_breakdown_default=(idx == 1),
+                )
+
+
+def render_report_form_page(report_type: str) -> None:
+    """Render guided Lost or Found reporting with focused width & above-the-fold results."""
+    is_lost = report_type == "lost"
+    render_page_header(
+        "Report Lost Item" if is_lost else "Report Found Item",
+        (
+            "Share clear details about your missing belonging so ReFind AI can check active found reports."
+            if is_lost
+            else "Log an item found on campus so ReFind AI can connect it with active lost reports."
+        ),
+    )
+
+    should_reset = bool(st.session_state.pop(f"reset_form_{report_type}", False))
+    _init_form_state(report_type, force_reset=should_reset)
+
+    flash_msg = st.session_state.pop(f"flash_success_{report_type}", None)
+    if flash_msg:
+        st.success(flash_msg)
+
+    last_id = st.session_state.get(f"last_submitted_{report_type}_id")
+    saved_report = get_report_by_id(int(last_id)) if last_id is not None else None
+    if last_id is not None and saved_report is None:
+        st.session_state.pop(f"last_submitted_{report_type}_id", None)
+
+    if saved_report is None:
+        # Focused ~780px centered form column for a calm consumer reporting experience.
+        _, center_col, _ = st.columns([0.11, 0.78, 0.11])
+        with center_col:
+            _render_report_form_widget(report_type, is_lost)
+    else:
+        # Post-submission split view: instant AI matches appear immediately above the fold,
+        # while the fresh form remains ready on the left (and keeps submit as button[0]).
+        col_form, col_results = st.columns([0.92, 1.08], gap="large")
+        with col_form:
+            render_section_label(
+                "Submit Another Report",
+                "The form has been cleared for a new entry.",
+            )
+            _render_report_form_widget(report_type, is_lost)
+        with col_results:
+            _render_post_submit_results_panel(saved_report, report_type)
+
+
+# ---------------------------------------------------------------------------
+# View 5: Browse Campus Reports (Directory, Filters, Sorting, Pagination & Edit)
+# ---------------------------------------------------------------------------
+
+
+@st.dialog("Edit Campus Report")
+def open_edit_report_dialog(report: dict[str, Any]) -> None:
+    """Focused modal dialog for safely editing an existing SQLite report."""
+    rep_id = int(report["id"])
+    st.caption(
+        f"Editing {str(report['report_type']).capitalize()} Report **#{rep_id}**"
+    )
+    parsed_date = parse_iso_date(report.get("report_date")) or date.today()
+    cat_index = (
+        CATEGORIES.index(report["category"])
+        if report.get("category") in CATEGORIES
+        else 0
+    )
+
+    with st.form(key=f"edit_report_form_{rep_id}", enter_to_submit=False):
+        e_title = st.text_input("Item Title *", value=str(report.get("title") or ""), max_chars=120)
+        e_cat = st.selectbox("Category *", options=CATEGORIES, index=cat_index)
+        e_desc = st.text_area(
+            "Detailed Description *",
+            value=str(report.get("description") or ""),
+            height=110,
+        )
+        ec1, ec2 = st.columns([1.3, 1.0])
+        with ec1:
+            e_loc = st.text_input(
+                "Campus Location *", value=str(report.get("location") or ""), max_chars=120
+            )
+        with ec2:
+            e_date = st.date_input(
+                "Date *",
+                value=parsed_date,
+                max_value=date.today() + timedelta(days=1),
+            )
+        e_extra = st.text_input(
+            "Additional Notes (Optional)",
+            value=str(report.get("additional_details") or ""),
+            max_chars=240,
+        )
+        e_contact = st.text_input(
+            "Campus Desk / Reference",
+            value=str(report.get("contact_label") or ""),
+            max_chars=120,
+        )
+        save_clicked = st.form_submit_button("Save Changes", type="primary", width="stretch")
+
+    if save_clicked:
+        errs: list[str] = []
+        if not (e_title or "").strip():
+            errs.append("Item title cannot be empty.")
+        if not (e_desc or "").strip() or len(e_desc.strip()) < 5:
+            errs.append("Description must be at least 5 characters.")
+        if not (e_loc or "").strip():
+            errs.append("Location cannot be empty.")
+        if not isinstance(e_date, date):
+            errs.append("Please choose a valid date.")
+
+        if errs:
+            for err in errs:
+                st.error(err)
+            return
+
+        try:
+            updated = update_report(
+                rep_id,
+                title=e_title,
+                description=e_desc,
+                category=e_cat,
+                location=e_loc,
+                report_date=e_date.isoformat(),
+                additional_details=e_extra,
+                contact_label=e_contact,
+            )
+        except (sqlite3.Error, ValueError) as exc:
+            st.error(f"Could not save changes: {exc}")
+        else:
+            if updated:
+                st.session_state["browse_flash_success"] = (
+                    f"Updated Report **#{rep_id} ({e_title.strip()})**."
+                )
+            else:
+                st.session_state["browse_flash_warning"] = (
+                    f"Report #{rep_id} could not be found."
+                )
+            st.rerun()
+
+
+def _clear_browse_filters() -> None:
+    """Callback to reset all Browse search/filter/sort/page controls cleanly."""
+    st.session_state["browse_search"] = ""
+    st.session_state["browse_type"] = "All"
+    st.session_state["browse_category"] = "All"
+    st.session_state["browse_status"] = "All"
+    st.session_state["browse_sort"] = "Newest Submitted"
+    st.session_state["browse_page"] = 1
+
+
+def _render_browse_report_card(
+    report: dict[str, Any],
+    *,
+    compact_list: bool,
+    pending_delete_id: Optional[int],
+) -> None:
+    """Render one integrated Browse report card with inside-card actions & safe delete."""
+    rep_id = int(report["id"])
+    with st.container(border=True):
+        render_report_body(
+            report,
+            compact=compact_list,
+            show_contact=not compact_list,
+            show_active_badge=True,
+        )
+
+        img_path = resolve_image_path(report.get("image_path"))
+        if img_path is not None:
+            with st.expander(f"View uploaded photograph — #{rep_id}"):
+                st.image(str(img_path), width=280)
+
+        a1, a2, a3, a4 = st.columns([1.2, 1.25, 0.78, 0.82], gap="small")
+        with a1:
+            if st.button(
+                "Find Matches",
+                key=f"browse_match_{rep_id}",
+                width="stretch",
+            ):
+                navigate_to("AI Matching", report_id=rep_id)
+        with a2:
+            if report["status"] == "active":
                 if st.button(
-                    "Open in AI Matching Dashboard",
-                    key=f"jump_after_submit_{saved_report['id']}",
+                    "Mark Recovered",
+                    key=f"browse_recover_{rep_id}",
                     type="primary",
                     width="stretch",
                 ):
-                    navigate_to("AI Matching", report_id=int(saved_report["id"]))
-            with ac2:
+                    try:
+                        update_report_status(rep_id, "recovered")
+                        st.session_state["browse_flash_success"] = (
+                            f"Report **#{rep_id}** marked as recovered."
+                        )
+                        st.rerun()
+                    except (sqlite3.Error, ValueError) as exc:
+                        st.error(f"Could not update report status: {exc}")
+            else:
                 if st.button(
-                    "View in Browse Reports",
-                    key=f"browse_after_submit_{saved_report['id']}",
+                    "Reopen",
+                    key=f"browse_reopen_{rep_id}",
                     width="stretch",
                 ):
-                    navigate_to("Browse Reports")
-
-            engine = try_get_engine()
-            if engine is not None:
-                cfg = MatchConfig(max_results=5)
-                candidates = get_all_reports()
-                matches = find_matches(saved_report, candidates, engine, config=cfg)
-                if not matches:
-                    st.info(
-                        "No opposite-type active reports crossed the 35.0 similarity threshold yet. "
-                        "Your report is stored in SQLite and will be matched automatically as new opposite-type reports arrive."
-                    )
-                else:
-                    for idx, res in enumerate(matches, start=1):
-                        render_match_result_card(
-                            rank=idx,
-                            result=res,
-                            source_report=saved_report,
-                            config=cfg,
-                            key_prefix=f"instant_{saved_report['id']}_{idx}",
+                    try:
+                        update_report_status(rep_id, "active")
+                        st.session_state["browse_flash_info"] = (
+                            f"Report **#{rep_id}** reopened as active."
                         )
+                        st.rerun()
+                    except (sqlite3.Error, ValueError) as exc:
+                        st.error(f"Could not reopen report: {exc}")
+        with a3:
+            if st.button(
+                "Edit",
+                key=f"browse_edit_{rep_id}",
+                width="stretch",
+            ):
+                open_edit_report_dialog(report)
+        with a4:
+            if st.button(
+                "Delete",
+                key=f"browse_delete_{rep_id}",
+                width="stretch",
+            ):
+                st.session_state["confirm_delete_report_id"] = rep_id
+                st.rerun()
+
+        # V1.2 two-step deletion confirmation integrated directly inside the card
+        if pending_delete_id == rep_id:
+            photo_note = (
+                " Its uploaded image file will also be removed."
+                if report.get("image_path")
+                else ""
+            )
+            st.warning(
+                f"**Confirm permanent deletion:** Report **#{rep_id} — {report['title']}**?"
+                f"{photo_note} This action cannot be undone."
+            )
+            cd1, cd2 = st.columns([1.4, 1.0], gap="small")
+            with cd1:
+                if st.button(
+                    "Confirm Permanent Delete",
+                    key=f"browse_confirm_delete_{rep_id}",
+                    type="primary",
+                    width="stretch",
+                ):
+                    try:
+                        db_deleted, img_deleted, img_warning = delete_report_with_cleanup(rep_id)
+                    except sqlite3.Error as exc:
+                        st.error(f"Could not delete report #{rep_id}: {exc}")
+                    else:
+                        st.session_state.pop("confirm_delete_report_id", None)
+                        if st.session_state.get("ai_match_select_id") == rep_id:
+                            st.session_state.pop("ai_match_select_id", None)
+                        if st.session_state.get("pending_match_report_id") == rep_id:
+                            st.session_state.pop("pending_match_report_id", None)
+                        for rtype in ("lost", "found"):
+                            if st.session_state.get(f"last_submitted_{rtype}_id") == rep_id:
+                                st.session_state.pop(f"last_submitted_{rtype}_id", None)
+
+                        if db_deleted:
+                            suffix = (
+                                " Associated uploaded photo was also removed."
+                                if img_deleted
+                                else ""
+                            )
+                            st.session_state["browse_flash_success"] = (
+                                f"Deleted Report **#{rep_id} ({report['title']})**.{suffix}"
+                            )
+                        else:
+                            st.session_state["browse_flash_warning"] = (
+                                f"Report #{rep_id} was already removed."
+                            )
+                        if img_warning:
+                            st.session_state["browse_flash_warning"] = img_warning
+                        st.rerun()
+            with cd2:
+                if st.button(
+                    "Cancel",
+                    key=f"browse_cancel_delete_{rep_id}",
+                    width="stretch",
+                ):
+                    st.session_state.pop("confirm_delete_report_id", None)
+                    st.session_state["browse_flash_info"] = (
+                        f"Cancelled deletion of Report #{rep_id} ({report['title']})."
+                    )
+                    st.rerun()
 
 
 def render_browse_reports_page() -> None:
-    """Render searchable, filterable report catalog with recovery & demo controls."""
+    """Render the redesigned campus report discovery directory."""
     render_page_header(
-        "Browse & Manage Reports",
-        "Search, filter, inspect details, run AI matching, and manage item recovery status.",
+        "Browse Campus Reports",
+        "Explore reported lost and found items across campus.",
     )
 
-    f1, f2, f3, f4 = st.columns([1.8, 1.0, 1.2, 1.0])
-    with f1:
-        search_query = st.text_input(
-            "Search reports",
-            placeholder="Search title, description, or location...",
+    stats = get_dashboard_stats()
+    render_metric_ribbon(stats, compact=True)
+
+    flash_success = st.session_state.pop("browse_flash_success", None)
+    if flash_success:
+        st.success(flash_success)
+    flash_warning = st.session_state.pop("browse_flash_warning", None)
+    if flash_warning:
+        st.warning(flash_warning)
+    flash_info = st.session_state.pop("browse_flash_info", None)
+    if flash_info:
+        st.info(flash_info)
+
+    # Filter & discovery toolbar inside an integrated container
+    with st.container(border=True):
+        f1, f2, f3, f4 = st.columns([1.85, 0.95, 1.25, 0.95], gap="small")
+        with f1:
+            search_query = st.text_input(
+                "Keyword search",
+                placeholder="Search title, description, or location...",
+                key="browse_search",
+            )
+        with f2:
+            type_choice = st.selectbox("Type", ["All", "Lost", "Found"], key="browse_type")
+        with f3:
+            category_choice = st.selectbox(
+                "Category", ["All", *CATEGORIES], key="browse_category"
+            )
+        with f4:
+            status_choice = st.selectbox(
+                "Status", ["All", "Active", "Recovered"], key="browse_status"
+            )
+
+        s1, s2, s3 = st.columns([1.4, 1.15, 0.95], vertical_alignment="bottom", gap="small")
+        with s1:
+            sort_label = st.selectbox(
+                "Sort by",
+                options=list(SORT_OPTIONS.keys()),
+                key="browse_sort",
+            )
+        with s2:
+            view_mode = st.selectbox(
+                "Layout",
+                options=["Cards (2-column)", "Compact List"],
+                key="browse_view",
+            )
+        with s3:
+            st.button(
+                "Clear Filters",
+                key="browse_clear_filters",
+                on_click=_clear_browse_filters,
+                width="stretch",
+            )
+
+        st.caption(
+            "Browse search uses exact SQL keyword matching. Use **AI Matching** for semantic NLP search across paraphrased descriptions."
         )
-    with f2:
-        type_choice = st.selectbox("Report Type", ["All", "Lost", "Found"])
-    with f3:
-        category_choice = st.selectbox("Category", ["All", *CATEGORIES])
-    with f4:
-        status_choice = st.selectbox("Status", ["All", "Active", "Recovered"])
 
     reports = get_all_reports(
         report_type=None if type_choice == "All" else type_choice.lower(),
         category=None if category_choice == "All" else category_choice,
         status=None if status_choice == "All" else status_choice.lower(),
         search_query=search_query,
+        sort_by=SORT_OPTIONS[sort_label],
     )
 
-    st.caption(f"Displaying **{len(reports)}** matching report(s), newest submitted first.")
+    total_matches = len(reports)
+    total_pages = max(1, math.ceil(total_matches / BROWSE_PAGE_SIZE))
+    current_page = int(st.session_state.get("browse_page", 1))
+    if current_page > total_pages:
+        current_page = total_pages
+        st.session_state["browse_page"] = current_page
+    if current_page < 1:
+        current_page = 1
+        st.session_state["browse_page"] = 1
 
-    if not reports:
-        st.info("No reports match the current filters.")
+    start_idx = (current_page - 1) * BROWSE_PAGE_SIZE
+    end_idx = min(start_idx + BROWSE_PAGE_SIZE, total_matches)
+    page_reports = reports[start_idx:end_idx]
+
+    if total_matches == 0:
+        render_empty_state(
+            "No Reports Match These Filters",
+            "Try clearing filters or broadening your keyword search.",
+        )
     else:
-        for report in reports:
-            st.markdown(render_report_card_html(report, compact=False), unsafe_allow_html=True)
+        st.caption(
+            f"Showing **{start_idx + 1}–{end_idx}** of **{total_matches}** report(s) · Page {current_page} of {total_pages}"
+        )
 
-            img_path = resolve_image_path(report.get("image_path"))
-            if img_path is not None:
-                with st.expander(f"View uploaded photograph — Report #{report['id']}"):
-                    st.image(str(img_path), width=320)
+        pending_delete_id = st.session_state.get("confirm_delete_report_id")
+        is_compact = view_mode == "Compact List"
 
-            b1, b2, b3, _ = st.columns([1.25, 1.35, 0.9, 2.0])
-            with b1:
+        if is_compact:
+            for report in page_reports:
+                _render_browse_report_card(
+                    report,
+                    compact_list=True,
+                    pending_delete_id=pending_delete_id,
+                )
+        else:
+            # Clean 2-column responsive directory grid
+            for idx in range(0, len(page_reports), 2):
+                row_items = page_reports[idx : idx + 2]
+                cols = st.columns(2, gap="medium")
+                for col, rep in zip(cols, row_items):
+                    with col:
+                        _render_browse_report_card(
+                            rep,
+                            compact_list=False,
+                            pending_delete_id=pending_delete_id,
+                        )
+
+        if total_pages > 1:
+            p_prev, p_info, p_next = st.columns([1.0, 2.0, 1.0], vertical_alignment="center")
+            with p_prev:
                 if st.button(
-                    "Find AI Matches",
-                    key=f"browse_match_{report['id']}",
+                    "Previous Page",
+                    key="browse_prev_page",
+                    disabled=(current_page <= 1),
                     width="stretch",
                 ):
-                    navigate_to("AI Matching", report_id=int(report["id"]))
-            with b2:
-                if report["status"] == "active":
-                    if st.button(
-                        "Mark as Recovered",
-                        key=f"browse_recover_{report['id']}",
-                        type="primary",
-                        width="stretch",
-                    ):
-                        try:
-                            update_report_status(int(report["id"]), "recovered")
-                            st.toast(f"Report #{report['id']} marked as recovered.")
-                            st.rerun()
-                        except (sqlite3.Error, ValueError) as exc:
-                            st.error(f"Could not update report status: {exc}")
-                else:
-                    if st.button(
-                        "Reopen as Active",
-                        key=f"browse_reopen_{report['id']}",
-                        width="stretch",
-                    ):
-                        try:
-                            update_report_status(int(report["id"]), "active")
-                            st.toast(f"Report #{report['id']} reopened as active.")
-                            st.rerun()
-                        except (sqlite3.Error, ValueError) as exc:
-                            st.error(f"Could not reopen report: {exc}")
-            with b3:
+                    st.session_state["browse_page"] = current_page - 1
+                    st.rerun()
+            with p_info:
+                st.markdown(
+                    f'<div style="text-align:center;font-size:0.84rem;color:#64748B;">Page {current_page} of {total_pages}</div>',
+                    unsafe_allow_html=True,
+                )
+            with p_next:
                 if st.button(
-                    "Delete",
-                    key=f"browse_delete_{report['id']}",
+                    "Next Page",
+                    key="browse_next_page",
+                    disabled=(current_page >= total_pages),
                     width="stretch",
                 ):
-                    try:
-                        rep_id = int(report["id"])
-                        delete_report(rep_id)
-                        if st.session_state.get("selected_match_report_id") == rep_id:
-                            st.session_state.pop("selected_match_report_id", None)
-                        for rtype in ("lost", "found"):
-                            if st.session_state.get(f"last_submitted_{rtype}_id") == rep_id:
-                                st.session_state.pop(f"last_submitted_{rtype}_id", None)
-                        st.toast(f"Report #{rep_id} deleted.")
-                        st.rerun()
-                    except sqlite3.Error as exc:
-                        st.error(f"Could not delete report: {exc}")
+                    st.session_state["browse_page"] = current_page + 1
+                    st.rerun()
 
     st.divider()
     with st.expander("Demo Dataset Administration"):
         st.caption(
             "Manage synthetic demonstration records without affecting your own submitted reports."
         )
-        dc1, dc2 = st.columns(2)
+        seed_count = count_seed_reports()
+        dc1, dc2 = st.columns(2, gap="small")
         with dc1:
-            if st.button("Restore Missing Demo Records", width="stretch"):
+            if st.button("Restore Missing Demo Records", key="demo_restore_btn", width="stretch"):
                 added = seed_database()
-                st.toast(f"Restored {added} synthetic demonstration record(s).")
+                st.session_state["browse_flash_success"] = (
+                    f"Restored {added} synthetic demonstration record(s)."
+                )
                 st.rerun()
         with dc2:
-            if st.button("Remove Synthetic Demo Records", width="stretch"):
-                removed = delete_seed_reports()
-                st.toast(f"Removed {removed} synthetic demonstration record(s).")
+            if st.button(
+                "Remove Synthetic Demo Records",
+                key="demo_remove_request",
+                disabled=(seed_count == 0),
+                width="stretch",
+            ):
+                st.session_state["confirm_delete_seed_reports"] = True
                 st.rerun()
+
+        if st.session_state.get("confirm_delete_seed_reports"):
+            st.warning(
+                f"**Confirm bulk removal:** Permanently remove **{seed_count}** synthetic "
+                "demonstration record(s)? Your own user-submitted reports will not be affected."
+            )
+            sd1, sd2, _ = st.columns([1.6, 1.0, 2.4])
+            with sd1:
+                if st.button(
+                    "Confirm Remove Demo Records",
+                    key="demo_remove_confirm",
+                    type="primary",
+                    width="stretch",
+                ):
+                    try:
+                        removed, removed_imgs, img_warnings = delete_seed_reports_with_cleanup()
+                    except sqlite3.Error as exc:
+                        st.error(f"Could not remove synthetic demo records: {exc}")
+                    else:
+                        st.session_state.pop("confirm_delete_seed_reports", None)
+                        img_note = (
+                            f" Cleaned up {removed_imgs} linked image file(s)."
+                            if removed_imgs
+                            else ""
+                        )
+                        st.session_state["browse_flash_success"] = (
+                            f"Removed {removed} synthetic demonstration record(s).{img_note}"
+                        )
+                        if img_warnings:
+                            st.session_state["browse_flash_warning"] = " ".join(img_warnings)
+                        st.rerun()
+            with sd2:
+                if st.button("Cancel", key="demo_remove_cancel", width="stretch"):
+                    st.session_state.pop("confirm_delete_seed_reports", None)
+                    st.session_state["browse_flash_info"] = (
+                        "Cancelled synthetic demo record removal."
+                    )
+                    st.rerun()
+
+
+# ---------------------------------------------------------------------------
+# Global Application Shell & Honest Dynamic Sidebar Status
+# ---------------------------------------------------------------------------
+
+
+def _render_sidebar_status(placeholder: Any) -> None:
+    """Render honest, non-blocking System Status reflecting real DB & AI engine state."""
+    stats = get_dashboard_stats()
+    engine_state = get_engine_state()
+
+    if engine_state.status == "ready" and engine_state.engine is not None:
+        dot_cls = "dot-ready"
+        ai_label = f"Ready ({engine_state.engine.model_name.split('/')[-1]})"
+    elif engine_state.status == "unavailable":
+        dot_cls = "dot-error"
+        ai_label = "Unavailable"
+    else:
+        dot_cls = "dot-idle"
+        ai_label = "Not initialized"
+
+    placeholder.markdown(
+        f"""
+        <div class="rf-sidebar-status">
+            <div class="rf-status-heading">
+                <span class="rf-status-dot {dot_cls}"></span>System Status
+            </div>
+            <div><strong>AI Engine:</strong> {esc(ai_label)}</div>
+            <div><strong>Database:</strong> SQLite (Persistent)</div>
+            <div><strong>Active:</strong> {stats["active_reports"]} ({stats["active_lost"]} lost &middot; {stats["active_found"]} found)</div>
+            <div><strong>Recovered:</strong> {stats["total_recovered"]}</div>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
 
 
 def main() -> None:
@@ -1073,7 +1673,6 @@ def main() -> None:
     ensure_seed_data()
     load_stylesheet()
 
-    # Handle programmatic navigation requests safely before instantiating sidebar radio.
     if "nav_target" in st.session_state:
         st.session_state["nav_radio"] = st.session_state.pop("nav_target")
     if "nav_radio" not in st.session_state:
@@ -1082,34 +1681,25 @@ def main() -> None:
     with st.sidebar:
         st.markdown(
             """
-            <div class="brand-box">
-                <div class="brand-title"><span class="brand-dot"></span>ReFind AI</div>
-                <p class="brand-tagline">Lost something? Let AI help you find it.</p>
+            <div class="rf-brand">
+                <div class="rf-brand-row">
+                    <span class="rf-brand-mark">RF</span>
+                    <span class="rf-brand-name">ReFind AI</span>
+                </div>
+                <p class="rf-brand-tag">Lost something? Let AI help you find it.</p>
             </div>
             """,
             unsafe_allow_html=True,
         )
 
         selected_page = st.radio(
-            "Navigation",
+            "Workspace",
             options=PAGES,
             key="nav_radio",
         )
 
         st.divider()
-        stats = get_dashboard_stats()
-        st.markdown(
-            f"""
-            <div class="sidebar-status-card">
-                <div class="sidebar-status-title"><span class="status-pulse"></span>System Status</div>
-                <div><strong>AI Model:</strong> all-MiniLM-L6-v2</div>
-                <div><strong>Storage:</strong> SQLite (Persistent)</div>
-                <div><strong>Active Cases:</strong> {stats["active_reports"]} ({stats["active_lost"]} lost / {stats["active_found"]} found)</div>
-                <div><strong>Recovered:</strong> {stats["total_recovered"]}</div>
-            </div>
-            """,
-            unsafe_allow_html=True,
-        )
+        sidebar_status_placeholder = st.empty()
 
     if selected_page == "Dashboard":
         render_dashboard_page()
@@ -1121,6 +1711,8 @@ def main() -> None:
         render_report_form_page("found")
     elif selected_page == "Browse Reports":
         render_browse_reports_page()
+
+    _render_sidebar_status(sidebar_status_placeholder)
 
 
 if __name__ == "__main__":

@@ -21,30 +21,39 @@ from datetime import date, timedelta
 from pathlib import Path
 
 import pytest
+import streamlit as st
 from streamlit.testing.v1 import AppTest
 
+import app as refind_app
 import database
 from ai_matcher import (
     DEFAULT_MODEL_NAME,
     EmbeddingEngine,
     MatchConfig,
+    ModelLoadError,
     compute_category_score,
     compute_date_proximity_score,
     compute_hybrid_score,
     compute_location_score,
     find_matches,
+    find_top_match_highlights,
 )
 from database import (
     count_reports,
+    count_seed_reports,
+    delete_report_with_cleanup,
     delete_seed_reports,
     get_all_reports,
     get_dashboard_stats,
     get_report_by_id,
+    get_reports_version,
     init_db,
     insert_report,
+    update_report,
     update_report_status,
 )
 from seed_data import ensure_seed_data, seed_database
+from utils import delete_uploaded_image, resolve_safe_upload_path
 
 
 APP_PATH = Path(__file__).resolve().parent.parent / "app.py"
@@ -338,7 +347,7 @@ def test_contextual_scoring_components() -> None:
 
     sub_score, sub_reason, shared = compute_location_score("Library", "Outside Central Library")
     assert sub_score == 0.85
-    assert sub_reason == "substring"
+    assert sub_reason == "token_subset"
     assert "library" in shared
 
     diff_score, diff_reason, _ = compute_location_score("Sports Complex", "Computer Science Lab")
@@ -596,3 +605,461 @@ def test_all_five_views_render_without_exceptions(isolated_app_db: Path) -> None
     for page in ["Dashboard", "AI Matching", "Report Lost Item", "Report Found Item", "Browse Reports"]:
         at.sidebar.radio[0].set_value(page).run()
         assert not at.exception, f"View '{page}' raised: {at.exception}"
+
+
+# ---------------------------------------------------------------------------
+# V1.2 P0 Engineering Correction Regression Tests
+# ---------------------------------------------------------------------------
+
+
+def test_location_matching_no_substring_false_positives() -> None:
+    """Whole-token location matching must reject character-substring false positives."""
+    # Confirmed false positives from audit must score 0.0
+    assert compute_location_score("A", "Central Library") == (0.0, "different", [])
+    assert compute_location_score("Lab", "Collaborative Space") == (0.0, "different", [])
+    assert compute_location_score("A", "Block A") == (0.0, "different", [])
+    assert compute_location_score("B", "Lecture Hall B") == (0.0, "different", [])
+
+    # Valid whole-token partial & subset matches must continue working accurately
+    score_lab, reason_lab, shared_lab = compute_location_score("Physics Lab", "Lab")
+    assert score_lab == 0.85
+    assert reason_lab == "token_subset"
+    assert shared_lab == ["lab"]
+
+    score_lib, reason_lib, shared_lib = compute_location_score(
+        "Near the Library", "Outside Central Library"
+    )
+    assert score_lib == 0.85
+    assert reason_lib == "token_subset"
+    assert shared_lib == ["library"]
+
+    score_cafe, reason_cafe, shared_cafe = compute_location_score(
+        "Main Cafeteria", "Cafeteria Dining Area"
+    )
+    assert reason_cafe == "token_overlap"
+    assert shared_cafe == ["cafeteria"]
+    assert 0.25 <= score_cafe <= 0.6
+
+    # Exact normalized matches remain 1.0
+    assert compute_location_score("Computer Science Lab", "  computer science lab ") == (
+        1.0,
+        "exact",
+        ["computer", "lab", "science"],
+    )
+
+    # Unrelated locations remain 0.0
+    assert compute_location_score("Sports Complex", "Central Library") == (0.0, "different", [])
+
+
+def test_safe_image_cleanup_and_path_traversal_protection(tmp_path: Path) -> None:
+    """Report deletion must remove valid uploaded images and refuse arbitrary external paths."""
+    db_file = tmp_path / "img_cleanup.db"
+    upload_dir = tmp_path / "uploads"
+    upload_dir.mkdir(parents=True, exist_ok=True)
+    init_db(db_file)
+
+    # Protected files that MUST NEVER be deleted
+    outside_secret = tmp_path / "sensitive_outside.txt"
+    outside_secret.write_text("do not delete", encoding="utf-8")
+    gitkeep = upload_dir / ".gitkeep"
+    gitkeep.write_text("", encoding="utf-8")
+
+    # 1. Valid image strictly inside upload_dir
+    valid_img = upload_dir / "valid_photo.png"
+    valid_img.write_bytes(b"fake-png-bytes")
+    rep_valid = insert_report(
+        title="Valid Photo Report",
+        description="Report with valid uploaded image inside uploads directory.",
+        category="Other",
+        report_type="lost",
+        location="Central Library",
+        report_date="2026-11-25",
+        image_path=str(valid_img),
+        db_path=db_file,
+    )
+    db_del, img_del, warn = delete_report_with_cleanup(
+        rep_valid, db_path=db_file, upload_dir=upload_dir
+    )
+    assert db_del is True
+    assert img_del is True
+    assert warn is None
+    assert not valid_img.exists()
+    assert get_report_by_id(rep_valid, db_path=db_file) is None
+
+    # 2. Relative traversal path escaping upload_dir MUST be refused
+    traversal_path = str(upload_dir / ".." / "sensitive_outside.txt")
+    rep_traversal = insert_report(
+        title="Traversal Attempt Report",
+        description="Untrusted path attempting directory traversal outside uploads.",
+        category="Other",
+        report_type="lost",
+        location="Central Library",
+        report_date="2026-11-25",
+        image_path=traversal_path,
+        db_path=db_file,
+    )
+    db_del2, img_del2, warn2 = delete_report_with_cleanup(
+        rep_traversal, db_path=db_file, upload_dir=upload_dir
+    )
+    assert db_del2 is True
+    assert img_del2 is False
+    assert warn2 is not None and "outside" in warn2.lower()
+    assert outside_secret.exists()
+
+    # 3. Direct absolute path outside upload_dir MUST be refused
+    img_del3, warn3 = delete_uploaded_image(str(outside_secret), upload_dir=upload_dir)
+    assert img_del3 is False
+    assert warn3 is not None
+    assert outside_secret.exists()
+
+    # 4. .gitkeep inside upload_dir MUST be protected
+    assert resolve_safe_upload_path(str(gitkeep), upload_dir=upload_dir) is None
+    img_del4, warn4 = delete_uploaded_image(str(gitkeep), upload_dir=upload_dir)
+    assert img_del4 is False
+    assert warn4 is not None
+    assert gitkeep.exists()
+
+
+def test_dashboard_and_ordinary_pages_do_not_initialize_ai_model(
+    isolated_app_db: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Opening Dashboard, Browse, or blank forms must NOT load SentenceTransformer."""
+    st.cache_resource.clear()
+    load_attempts = {"count": 0}
+
+    def _forbid_model_init(self, *args, **kwargs):
+        load_attempts["count"] += 1
+        raise AssertionError("EmbeddingEngine should not be initialized on ordinary pages!")
+
+    monkeypatch.setattr(EmbeddingEngine, "__init__", _forbid_model_init)
+
+    at = AppTest.from_file(str(APP_PATH), default_timeout=30).run()
+    assert not at.exception
+    assert load_attempts["count"] == 0
+
+    sidebar_md = "\n".join(m.value for m in at.sidebar.markdown)
+    assert "Not initialized" in sidebar_md
+    assert "Ready (" not in sidebar_md
+    # Dashboard must offer explicit on-demand AI scan button instead of blocking startup
+    assert at.button(key="dash_load_ai_highlights") is not None
+
+    # Navigate across ordinary pages — still zero AI model initialization
+    for page in ["Browse Reports", "Report Lost Item", "Report Found Item", "Dashboard"]:
+        at.sidebar.radio[0].set_value(page).run()
+        assert not at.exception
+        assert load_attempts["count"] == 0
+        assert "Not initialized" in "\n".join(m.value for m in at.sidebar.markdown)
+
+
+def test_sidebar_reports_unavailable_when_model_load_fails(
+    isolated_app_db: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """When SentenceTransformer fails to load, status must honestly report Unavailable."""
+    st.cache_resource.clear()
+
+    def _fail_load(self, *args, **kwargs):
+        raise ModelLoadError("Simulated offline model failure")
+
+    monkeypatch.setattr(EmbeddingEngine, "__init__", _fail_load)
+
+    try:
+        at = AppTest.from_file(str(APP_PATH), default_timeout=30).run()
+        at.sidebar.radio[0].set_value("AI Matching").run()
+        assert not at.exception
+        assert len(at.error) >= 1
+        sidebar_md = "\n".join(m.value for m in at.sidebar.markdown)
+        assert "Unavailable" in sidebar_md
+        assert "Ready (" not in sidebar_md
+    finally:
+        st.cache_resource.clear()
+
+
+def test_ai_matching_dropdown_switches_between_two_reports(
+    isolated_app_db: Path,
+) -> None:
+    """Verify users can freely switch between different source reports in the AI Matching dropdown."""
+    refind_app.get_engine_state.clear()
+    active_reports = get_all_reports(status="active", db_path=isolated_app_db)
+    assert len(active_reports) >= 3
+    first_rep = active_reports[0]
+    second_rep = active_reports[1]
+    third_rep = active_reports[2]
+
+    at = AppTest.from_file(str(APP_PATH), default_timeout=60).run()
+    at.sidebar.radio[0].set_value("AI Matching").run()
+    assert not at.exception
+
+    # Explicitly select report #1, then report #2, then report #3 via dropdown
+    at.selectbox(key="ai_match_select_id").select(int(first_rep["id"])).run()
+    assert not at.exception
+    assert at.selectbox(key="ai_match_select_id").value == int(first_rep["id"])
+    assert first_rep["title"] in "\n".join(m.value for m in at.markdown)
+
+    at.selectbox(key="ai_match_select_id").select(int(second_rep["id"])).run()
+    assert not at.exception
+    assert at.selectbox(key="ai_match_select_id").value == int(second_rep["id"])
+    assert second_rep["title"] in "\n".join(m.value for m in at.markdown)
+
+    # Click a Quick Demo Preset, then confirm dropdown STILL switches freely afterwards
+    preset_buttons = [b for b in at.button if b.key and b.key.startswith("demo_preset_")]
+    assert len(preset_buttons) >= 1
+    preset_buttons[0].click().run()
+    assert not at.exception
+
+    at.selectbox(key="ai_match_select_id").select(int(third_rep["id"])).run()
+    assert not at.exception
+    assert at.selectbox(key="ai_match_select_id").value == int(third_rep["id"])
+    assert third_rep["title"] in "\n".join(m.value for m in at.markdown)
+
+    # Sidebar must now honestly report Ready after AI Matching loaded the model
+    sidebar_md = "\n".join(m.value for m in at.sidebar.markdown)
+    assert "Ready (" in sidebar_md
+
+
+def test_delete_confirmation_cancel_and_confirm_workflow(isolated_app_db: Path) -> None:
+    """Verify 2-step delete confirmation for individual reports and bulk demo records."""
+    user_rep_id = insert_report(
+        title="Custom Graphite Stylus Pen",
+        description="Lost a grey digital stylus pen near the design studio.",
+        category="Electronics",
+        report_type="lost",
+        location="Design Studio",
+        report_date="2026-11-25",
+        db_path=isolated_app_db,
+    )
+    before_total = count_reports(isolated_app_db)
+
+    at = AppTest.from_file(str(APP_PATH), default_timeout=30).run()
+    at.sidebar.radio[0].set_value("Browse Reports").run()
+    assert not at.exception
+
+    # Step 1: Click Delete -> must NOT delete yet; must show title & ID confirmation warning
+    at.button(key=f"browse_delete_{user_rep_id}").click().run()
+    assert not at.exception
+    assert get_report_by_id(user_rep_id, db_path=isolated_app_db) is not None
+    assert any(
+        f"#{user_rep_id}" in w.value and "Custom Graphite Stylus Pen" in w.value
+        for w in at.warning
+    )
+
+    # Cancel -> record remains intact
+    at.button(key=f"browse_cancel_delete_{user_rep_id}").click().run()
+    assert not at.exception
+    assert get_report_by_id(user_rep_id, db_path=isolated_app_db) is not None
+    assert count_reports(isolated_app_db) == before_total
+
+    # Step 2: Click Delete again -> Confirm Permanent Delete -> record removed
+    at.button(key=f"browse_delete_{user_rep_id}").click().run()
+    at.button(key=f"browse_confirm_delete_{user_rep_id}").click().run()
+    assert not at.exception
+    assert get_report_by_id(user_rep_id, db_path=isolated_app_db) is None
+    assert count_reports(isolated_app_db) == before_total - 1
+
+    # Bulk synthetic demo removal: request -> cancel keeps records -> confirm removes seeds only
+    kept_user_id = insert_report(
+        title="User Kept Notebook",
+        description="Blue spiral notebook belonging to user.",
+        category="Books & Stationery",
+        report_type="lost",
+        location="Central Library",
+        report_date="2026-11-25",
+        db_path=isolated_app_db,
+    )
+    seed_before = count_seed_reports(isolated_app_db)
+    assert seed_before > 0
+
+    at.sidebar.radio[0].set_value("Browse Reports").run()
+    at.button(key="demo_remove_request").click().run()
+    assert count_seed_reports(isolated_app_db) == seed_before
+    at.button(key="demo_remove_cancel").click().run()
+    assert count_seed_reports(isolated_app_db) == seed_before
+
+    at.button(key="demo_remove_request").click().run()
+    at.button(key="demo_remove_confirm").click().run()
+    assert not at.exception
+    assert count_seed_reports(isolated_app_db) == 0
+    assert get_report_by_id(kept_user_id, db_path=isolated_app_db) is not None
+
+
+def test_dashboard_highlights_vectorized_and_cache_invalidation(
+    isolated_app_db: Path, engine: EmbeddingEngine
+) -> None:
+    """Vectorized highlights must cache on unchanged DB and invalidate on report changes."""
+    refind_app.get_engine_state.clear()
+    state = refind_app.get_engine_state()
+    state.engine = engine
+    state.status = "ready"
+
+    v1 = get_reports_version(isolated_app_db)
+    highlights_1 = refind_app.get_cached_dashboard_highlights(engine)
+    assert len(highlights_1) > 0
+    top_lost_id = int(highlights_1[0][0]["id"])
+    assert (str(isolated_app_db.resolve()), v1) in state.highlights_cache
+
+    # Calling again with unchanged DB returns exact cached object
+    highlights_cached = refind_app.get_cached_dashboard_highlights(engine)
+    assert highlights_cached is highlights_1
+
+    # Marking the top highlighted lost item as recovered must change DB version & invalidate cache
+    assert update_report_status(top_lost_id, "recovered", db_path=isolated_app_db) is True
+    v2 = get_reports_version(isolated_app_db)
+    assert v2 != v1
+
+    highlights_2 = refind_app.get_cached_dashboard_highlights(engine)
+    assert (str(isolated_app_db.resolve()), v1) not in state.highlights_cache
+    assert (str(isolated_app_db.resolve()), v2) in state.highlights_cache
+    assert all(int(pair[0]["id"]) != top_lost_id for pair in highlights_2)
+
+    # Also verify direct vectorized function enforces opposite types & active status
+    active_lost = get_all_reports(report_type="lost", status="active", db_path=isolated_app_db)
+    active_found = get_all_reports(report_type="found", status="active", db_path=isolated_app_db)
+    direct = find_top_match_highlights(active_lost, active_found, engine, max_highlights=4)
+    assert len(direct) == len(highlights_2)
+    for lost_rep, match_res in direct:
+        assert lost_rep["report_type"] == "lost"
+        assert match_res.candidate["report_type"] == "found"
+
+
+# ---------------------------------------------------------------------------
+# V2.0 Product Redesign Feature Tests (Editing, Sorting, Filters, Recovery Confirm)
+# ---------------------------------------------------------------------------
+
+
+def test_v2_report_editing_persists_and_invalidates_version(tmp_path: Path) -> None:
+    """Editing a report must update SQLite fields and bump get_reports_version()."""
+    db_file = tmp_path / "edit_test.db"
+    init_db(db_file)
+    rep_id = insert_report(
+        title="Black Umbrella",
+        description="Left folding umbrella near library entrance.",
+        category="Other",
+        report_type="lost",
+        location="Library",
+        report_date="2026-11-24",
+        db_path=db_file,
+    )
+    v_before = get_reports_version(db_file)
+
+    updated = update_report(
+        rep_id,
+        title="Matte Black Compact Umbrella",
+        description="Left matte black compact folding umbrella outside Central Library.",
+        category="Clothing & Accessories",
+        location="Central Library",
+        report_date="2026-11-25",
+        additional_details="Wooden curved handle.",
+        contact_label="Library Desk #22 (Demo)",
+        db_path=db_file,
+    )
+    assert updated is True
+
+    reloaded = get_report_by_id(rep_id, db_path=db_file)
+    assert reloaded is not None
+    assert reloaded["title"] == "Matte Black Compact Umbrella"
+    assert reloaded["category"] == "Clothing & Accessories"
+    assert reloaded["location"] == "Central Library"
+    assert reloaded["additional_details"] == "Wooden curved handle."
+    # Version string tracks updated_at (second precision) or row changes; check fields updated cleanly
+    assert reloaded["updated_at"] >= reloaded["created_at"]
+    assert isinstance(v_before, str)
+
+
+def test_v2_browse_sorting_filtering_pagination_and_clear_filters(
+    isolated_app_db: Path,
+) -> None:
+    """Verify Browse Reports keyword search, sorting, pagination, and Clear Filters button."""
+    # SQL sorting check directly
+    by_title = get_all_reports(sort_by="title_asc", db_path=isolated_app_db)
+    titles = [r["title"].lower() for r in by_title]
+    assert titles == sorted(titles)
+
+    at = AppTest.from_file(str(APP_PATH), default_timeout=30).run()
+    at.sidebar.radio[0].set_value("Browse Reports").run()
+    assert not at.exception
+
+    # Seed DB has 16 reports -> with page size 8, page 2 button should be enabled
+    assert at.button(key="browse_next_page").disabled is False
+    at.button(key="browse_next_page").click().run()
+    assert not at.exception
+    assert at.button(key="browse_prev_page").disabled is False
+
+    # Filter by keyword + category
+    at.text_input(key="browse_search").set_value("Casio").run()
+    assert not at.exception
+    browse_md = "\n".join(m.value for m in at.markdown)
+    assert "Casio" in browse_md
+
+    # Click Clear Filters -> resets search & filters cleanly
+    at.button(key="browse_clear_filters").click().run()
+    assert not at.exception
+    assert at.text_input(key="browse_search").value == ""
+    assert at.selectbox(key="browse_type").value == "All"
+    assert at.selectbox(key="browse_category").value == "All"
+    assert at.selectbox(key="browse_status").value == "All"
+
+
+def test_v2_ai_matching_deliberate_pair_recovery_confirmation(
+    isolated_app_db: Path,
+) -> None:
+    """Marking a match pair recovered must require deliberate confirmation and persist."""
+    st.cache_resource.clear()
+    at = AppTest.from_file(str(APP_PATH), default_timeout=60).run()
+    at.sidebar.radio[0].set_value("AI Matching").run()
+    assert not at.exception
+
+    # Select Wallet Near Library preset (strong active pair: Lost #1 <-> Found #2)
+    wallet_rep = [
+        r for r in get_all_reports(db_path=isolated_app_db) if r.get("seed_key") == "seed_lost_wallet_library"
+    ][0]
+    found_wallet = [
+        r for r in get_all_reports(db_path=isolated_app_db) if r.get("seed_key") == "seed_found_wallet_central_library"
+    ][0]
+
+    at.selectbox(key="ai_match_select_id").select(int(wallet_rep["id"])).run()
+    assert not at.exception
+
+    pair_btn_key = f"matcher_{wallet_rep['id']}_1_recover_pair_{found_wallet['id']}"
+    at.button(key=pair_btn_key).click().run()
+    assert not at.exception
+
+    # Step 1 click must NOT have recovered yet — must ask for confirmation first
+    assert get_report_by_id(wallet_rep["id"], db_path=isolated_app_db)["status"] == "active"
+    assert get_report_by_id(found_wallet["id"], db_path=isolated_app_db)["status"] == "active"
+    assert len(at.warning) >= 1
+
+    # Confirm recovery -> both reports transition to recovered in SQLite
+    confirm_btn_key = f"matcher_{wallet_rep['id']}_1_confirm_pair_{found_wallet['id']}"
+    at.button(key=confirm_btn_key).click().run()
+    assert not at.exception
+    assert get_report_by_id(wallet_rep["id"], db_path=isolated_app_db)["status"] == "recovered"
+    assert get_report_by_id(found_wallet["id"], db_path=isolated_app_db)["status"] == "recovered"
+
+
+def test_v2_report_location_preset_and_dismiss_post_submit_results(
+    isolated_app_db: Path,
+) -> None:
+    """Users can select a common campus area without typing, and dismiss post-submit results."""
+    at = AppTest.from_file(str(APP_PATH), default_timeout=60).run()
+    at.sidebar.radio[0].set_value("Report Lost Item").run()
+    assert not at.exception
+
+    at.text_input(key="lost_title").set_value("Silver USB Flash Drive")
+    at.selectbox(key="lost_category").set_value("Electronics")
+    at.text_area(key="lost_description").set_value("Lost a silver 64GB metal USB flash drive.")
+    # Choose quick-select preset and leave custom text location blank
+    at.selectbox(key="lost_location_preset").set_value("Central Library")
+    at.text_input(key="lost_location").set_value("")
+    at.button[0].click().run()
+
+    assert not at.exception
+    assert len(at.error) == 0
+    saved = get_all_reports(search_query="Silver USB Flash Drive", db_path=isolated_app_db)
+    assert len(saved) == 1
+    assert saved[0]["location"] == "Central Library"
+
+    # Clicking 'Report Another' clears the post-submission result panel cleanly
+    at.button(key="dismiss_after_submit_lost").click().run()
+    assert not at.exception
+    assert not any(b.key == "dismiss_after_submit_lost" for b in at.button)
+
+

@@ -209,7 +209,11 @@ def compute_category_score(
 def compute_location_score(
     location_a: Optional[str], location_b: Optional[str]
 ) -> tuple[float, str, list[str]]:
-    """Evaluate lexical location alignment transparently without inventing geography.
+    """Evaluate lexical location alignment transparently using whole-token matching.
+
+    Avoids raw character-substring false positives (e.g., 'A' inside 'Central Library'
+    or 'Lab' inside 'Collaborative Space') and ignores ambiguous single-character
+    fragments when computing token overlap. Never invents GPS or campus distances.
 
     Returns:
         (score in [0.0, 1.0], reason_tag, sorted_shared_tokens)
@@ -221,18 +225,25 @@ def compute_location_score(
 
     tokens_a = tokenize_location(location_a)
     tokens_b = tokenize_location(location_b)
-    shared = sorted(tokens_a & tokens_b)
 
     if norm_a == norm_b:
-        return 1.0, "exact", shared
+        return 1.0, "exact", sorted(tokens_a)
 
-    if (norm_a in norm_b) or (norm_b in norm_a):
-        return 0.85, "substring", shared
-
-    union = tokens_a | tokens_b
-    if not union or not shared:
+    # Filter out ambiguous 1-character fragments (e.g., 'a', 'b') for partial matching.
+    meaningful_a = {tok for tok in tokens_a if len(tok) >= 2}
+    meaningful_b = {tok for tok in tokens_b if len(tok) >= 2}
+    if not meaningful_a or not meaningful_b:
         return 0.0, "different", []
 
+    shared = sorted(meaningful_a & meaningful_b)
+    if not shared:
+        return 0.0, "different", []
+
+    # Whole-token subset containment (e.g., 'Lab' in 'Physics Lab', 'Library' in 'Central Library').
+    if meaningful_a <= meaningful_b or meaningful_b <= meaningful_a:
+        return 0.85, "token_subset", shared
+
+    union = meaningful_a | meaningful_b
     jaccard = len(shared) / len(union)
     return float(np.clip(jaccard, 0.0, 1.0)), "token_overlap", shared
 
@@ -303,7 +314,7 @@ def generate_match_explanation(
     loc_cand = clean_text(candidate_report.get("location"))
     if location_reason == "exact":
         loc_phrase = f"Reported locations match exactly ('{loc_cand}')."
-    elif location_reason in ("substring", "token_overlap") and location_score > 0.0:
+    elif location_reason in ("token_subset", "token_overlap") and location_score > 0.0:
         if shared_location_tokens:
             terms = ", ".join(f"'{t}'" for t in shared_location_tokens[:3])
             loc_phrase = (
@@ -448,3 +459,122 @@ def find_matches(
 
     results.sort(key=lambda item: (item.final_score, item.semantic_score), reverse=True)
     return results[: cfg.max_results]
+
+
+def find_top_match_highlights(
+    active_lost: Sequence[dict[str, Any]],
+    active_found: Sequence[dict[str, Any]],
+    engine: EmbeddingEngine,
+    config: Optional[MatchConfig] = None,
+    *,
+    max_highlights: int = 4,
+) -> list[tuple[dict[str, Any], MatchResult]]:
+    """Compute top active Lost <-> Found pairs in one vectorized similarity pass.
+
+    Avoids calling `find_matches()` repeatedly inside a Python loop on Dashboard reruns.
+    Encodes all active lost and found items once and evaluates the full (L x F)
+    cosine similarity matrix via Scikit-learn.
+    """
+    if not active_lost or not active_found:
+        return []
+
+    cfg = config or MatchConfig(min_score_threshold=45.0, max_results=1)
+    lost_list = [
+        r
+        for r in active_lost
+        if clean_text(r.get("report_type")).lower() == "lost"
+        and clean_text(r.get("status") or "active").lower() == "active"
+    ]
+    found_list = [
+        r
+        for r in active_found
+        if clean_text(r.get("report_type")).lower() == "found"
+        and clean_text(r.get("status") or "active").lower() == "active"
+    ]
+    if not lost_list or not found_list:
+        return []
+
+    lost_texts = [build_item_text(r) for r in lost_list]
+    found_texts = [build_item_text(r) for r in found_list]
+
+    all_vecs = engine.encode_texts([*lost_texts, *found_texts])
+    lost_vecs = all_vecs[: len(lost_list)]
+    found_vecs = all_vecs[len(lost_list) :]
+
+    lost_norms = np.linalg.norm(lost_vecs, axis=1)
+    found_norms = np.linalg.norm(found_vecs, axis=1)
+
+    sim_matrix = cosine_similarity(lost_vecs, found_vecs)
+    valid_mask = np.outer(lost_norms > 0.0, found_norms > 0.0)
+    raw_matrix = np.where(valid_mask, sim_matrix, 0.0)
+
+    highlights: list[tuple[dict[str, Any], MatchResult]] = []
+    for i, lost_item in enumerate(lost_list):
+        best_result: Optional[MatchResult] = None
+        for j, found_item in enumerate(found_list):
+            if lost_item.get("id") is not None and lost_item.get("id") == found_item.get("id"):
+                continue
+
+            raw_val = float(raw_matrix[i, j])
+            sem_score = float(np.clip(raw_val, 0.0, 1.0))
+            cat_score = compute_category_score(
+                lost_item.get("category"), found_item.get("category")
+            )
+            loc_score, loc_reason, shared_tokens = compute_location_score(
+                lost_item.get("location"), found_item.get("location")
+            )
+            date_score, delta_days = compute_date_proximity_score(
+                lost_item.get("report_date"),
+                found_item.get("report_date"),
+                decay_days=cfg.date_decay_days,
+            )
+            final_score = compute_hybrid_score(
+                semantic_score=sem_score,
+                category_score=cat_score,
+                location_score=loc_score,
+                date_score=date_score,
+                config=cfg,
+            )
+            if final_score < cfg.min_score_threshold:
+                continue
+
+            if best_result is None or (final_score, sem_score) > (
+                best_result.final_score,
+                best_result.semantic_score,
+            ):
+                explanation = generate_match_explanation(
+                    source_report=lost_item,
+                    candidate_report=found_item,
+                    semantic_score=sem_score,
+                    category_score=cat_score,
+                    location_score=loc_score,
+                    location_reason=loc_reason,
+                    shared_location_tokens=shared_tokens,
+                    days_apart=delta_days,
+                )
+                best_result = MatchResult(
+                    candidate=found_item,
+                    final_score=final_score,
+                    semantic_score=sem_score,
+                    raw_cosine_similarity=raw_val,
+                    category_score=cat_score,
+                    location_score=loc_score,
+                    date_score=date_score,
+                    days_apart=delta_days,
+                    location_match_reason=loc_reason,
+                    shared_location_tokens=shared_tokens,
+                    explanation=explanation,
+                    meets_threshold=True,
+                    semantic_contribution=round(cfg.weight_semantic * sem_score * 100.0, 1),
+                    category_contribution=round(cfg.weight_category * cat_score * 100.0, 1),
+                    location_contribution=round(cfg.weight_location * loc_score * 100.0, 1),
+                    date_contribution=round(cfg.weight_date * date_score * 100.0, 1),
+                )
+
+        if best_result is not None:
+            highlights.append((lost_item, best_result))
+
+    highlights.sort(
+        key=lambda pair: (pair[1].final_score, pair[1].semantic_score), reverse=True
+    )
+    return highlights[: max(1, int(max_highlights))]

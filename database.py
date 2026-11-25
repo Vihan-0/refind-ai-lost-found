@@ -11,7 +11,14 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Optional, Union
 
-from utils import DEFAULT_DB_PATH, REPORT_TYPES, STATUS_OPTIONS, clean_text
+from utils import (
+    DEFAULT_DB_PATH,
+    DEFAULT_UPLOAD_DIR,
+    REPORT_TYPES,
+    STATUS_OPTIONS,
+    clean_text,
+    delete_uploaded_image,
+)
 
 PathLike = Union[str, Path]
 
@@ -256,16 +263,26 @@ def get_report_by_id(
         return dict(row) if row is not None else None
 
 
+SORT_ORDER_SQL: dict[str, str] = {
+    "newest": "created_at DESC, id DESC",
+    "oldest": "created_at ASC, id ASC",
+    "date_desc": "report_date DESC, id DESC",
+    "date_asc": "report_date ASC, id ASC",
+    "title_asc": "LOWER(title) ASC, id DESC",
+}
+
+
 def get_all_reports(
     *,
     report_type: Optional[str] = None,
     category: Optional[str] = None,
     status: Optional[str] = None,
     search_query: Optional[str] = None,
+    sort_by: str = "newest",
     limit: Optional[int] = None,
     db_path: Optional[PathLike] = None,
 ) -> list[dict[str, Any]]:
-    """Retrieve reports with optional parameterized filtering, most recently created first."""
+    """Retrieve reports with optional parameterized filtering and safe sorting."""
     clauses: list[str] = []
     params: list[Any] = []
 
@@ -289,10 +306,12 @@ def get_all_reports(
         )
         params.extend([like_term, like_term, like_term, like_term, like_term])
 
+    order_clause = SORT_ORDER_SQL.get(sort_by, SORT_ORDER_SQL["newest"])
+
     sql = "SELECT * FROM reports"
     if clauses:
         sql += " WHERE " + " AND ".join(clauses)
-    sql += " ORDER BY created_at DESC, id DESC"
+    sql += f" ORDER BY {order_clause}"
 
     if limit is not None and int(limit) > 0:
         sql += " LIMIT ?"
@@ -301,6 +320,66 @@ def get_all_reports(
     with get_connection(db_path) as conn:
         rows = conn.execute(sql, tuple(params)).fetchall()
         return [dict(row) for row in rows]
+
+
+def update_report(
+    report_id: int,
+    *,
+    title: str,
+    description: str,
+    category: str,
+    location: str,
+    report_date: str,
+    additional_details: str = "",
+    contact_label: str = "",
+    db_path: Optional[PathLike] = None,
+) -> bool:
+    """Update editable fields of an existing report safely using parameterized SQL."""
+    clean_title = clean_text(title)
+    clean_desc = clean_text(description)
+    clean_cat = clean_text(category) or "Other"
+    clean_loc = clean_text(location)
+    clean_date = clean_text(report_date)
+    clean_extra = clean_text(additional_details)
+    clean_contact = clean_text(contact_label) or "Campus Lost & Found Desk (Demo)"
+
+    if not clean_title:
+        raise ValueError("Item title is required.")
+    if not clean_desc:
+        raise ValueError("Item description is required.")
+    if not clean_loc:
+        raise ValueError("Location is required.")
+    if not clean_date:
+        raise ValueError("Report date is required.")
+
+    with get_connection(db_path) as conn:
+        cursor = conn.execute(
+            """
+            UPDATE reports
+            SET title = ?,
+                description = ?,
+                category = ?,
+                location = ?,
+                report_date = ?,
+                additional_details = ?,
+                contact_label = ?,
+                updated_at = ?
+            WHERE id = ?
+            """,
+            (
+                clean_title,
+                clean_desc,
+                clean_cat,
+                clean_loc,
+                clean_date,
+                clean_extra,
+                clean_contact,
+                _utc_now_iso(),
+                int(report_id),
+            ),
+        )
+        conn.commit()
+        return cursor.rowcount > 0
 
 
 def update_report_status(
@@ -328,12 +407,97 @@ def delete_report(report_id: int, db_path: Optional[PathLike] = None) -> bool:
         return cursor.rowcount > 0
 
 
+def delete_report_with_cleanup(
+    report_id: int,
+    *,
+    db_path: Optional[PathLike] = None,
+    upload_dir: PathLike = DEFAULT_UPLOAD_DIR,
+) -> tuple[bool, bool, Optional[str]]:
+    """Delete a report and safely clean up any uploaded image inside upload_dir.
+
+    Returns:
+        (db_deleted, image_deleted, image_warning)
+    """
+    existing = get_report_by_id(report_id, db_path=db_path)
+    if existing is None:
+        return False, False, None
+
+    deleted = delete_report(report_id, db_path=db_path)
+    if not deleted:
+        return False, False, None
+
+    image_deleted, image_warning = delete_uploaded_image(
+        existing.get("image_path"), upload_dir=Path(upload_dir)
+    )
+    return True, image_deleted, image_warning
+
+
 def delete_seed_reports(db_path: Optional[PathLike] = None) -> int:
     """Remove all synthetic demonstration records while preserving user submissions."""
     with get_connection(db_path) as conn:
         cursor = conn.execute("DELETE FROM reports WHERE is_seed = 1")
         conn.commit()
         return int(cursor.rowcount)
+
+
+def delete_seed_reports_with_cleanup(
+    *,
+    db_path: Optional[PathLike] = None,
+    upload_dir: PathLike = DEFAULT_UPLOAD_DIR,
+) -> tuple[int, int, list[str]]:
+    """Remove synthetic demo records and safely clean up any linked upload files.
+
+    Returns:
+        (removed_db_count, removed_image_count, image_warnings)
+    """
+    with get_connection(db_path) as conn:
+        rows = conn.execute(
+            "SELECT image_path FROM reports WHERE is_seed = 1 AND image_path IS NOT NULL"
+        ).fetchall()
+        image_paths = [str(row["image_path"]) for row in rows if row["image_path"]]
+        cursor = conn.execute("DELETE FROM reports WHERE is_seed = 1")
+        conn.commit()
+        removed_count = int(cursor.rowcount)
+
+    removed_images = 0
+    warnings: list[str] = []
+    for path_str in image_paths:
+        img_deleted, img_warn = delete_uploaded_image(path_str, upload_dir=Path(upload_dir))
+        if img_deleted:
+            removed_images += 1
+        if img_warn:
+            warnings.append(img_warn)
+    return removed_count, removed_images, warnings
+
+
+def count_seed_reports(db_path: Optional[PathLike] = None) -> int:
+    """Return number of synthetic demonstration reports currently stored."""
+    with get_connection(db_path) as conn:
+        row = conn.execute("SELECT COUNT(*) AS cnt FROM reports WHERE is_seed = 1").fetchone()
+        return int(row["cnt"]) if row else 0
+
+
+def get_reports_version(db_path: Optional[PathLike] = None) -> str:
+    """Return a lightweight fingerprint that changes on any insert, update, or delete.
+
+    Used to invalidate cached AI highlight computations whenever report data changes.
+    """
+    with get_connection(db_path) as conn:
+        row = conn.execute(
+            """
+            SELECT
+                COUNT(*) AS cnt,
+                COALESCE(MAX(id), 0) AS max_id,
+                COALESCE(MAX(updated_at), '') AS max_updated,
+                COALESCE(SUM(CASE WHEN status = 'active' THEN 1 ELSE 0 END), 0) AS active_cnt,
+                COALESCE(SUM(CASE WHEN report_type = 'lost' THEN 1 ELSE 0 END), 0) AS lost_cnt
+            FROM reports
+            """
+        ).fetchone()
+        return (
+            f"{int(row['cnt'])}:{int(row['max_id'])}:{row['max_updated']}:"
+            f"{int(row['active_cnt'])}:{int(row['lost_cnt'])}"
+        )
 
 
 def count_reports(db_path: Optional[PathLike] = None) -> int:

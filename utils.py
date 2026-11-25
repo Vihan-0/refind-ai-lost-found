@@ -207,3 +207,71 @@ def resolve_image_path(stored_path: Optional[str]) -> Optional[Path]:
     if resolved.exists() and resolved.is_file():
         return resolved
     return None
+
+
+def resolve_safe_upload_path(
+    stored_path: Optional[str], upload_dir: Path = DEFAULT_UPLOAD_DIR
+) -> Optional[Path]:
+    """Resolve stored_path ONLY if it strictly resides inside the designated uploads directory.
+
+    Protects against path traversal (e.g., '../app.py'), arbitrary absolute paths,
+    symlinks escaping the upload directory, and deleting '.gitkeep'.
+    Returns the resolved Path if safe, or None if untrusted/empty.
+    """
+    if not stored_path or not str(stored_path).strip():
+        return None
+
+    root = Path(upload_dir)
+    if not root.is_absolute():
+        root = BASE_DIR / root
+    try:
+        allowed_root = root.resolve()
+    except OSError:
+        return None
+
+    candidate = Path(stored_path)
+    if not candidate.is_absolute():
+        candidate = BASE_DIR / candidate
+    try:
+        resolved = candidate.resolve()
+    except OSError:
+        return None
+
+    if resolved == allowed_root or resolved.name == ".gitkeep":
+        return None
+    if not resolved.is_relative_to(allowed_root):
+        return None
+    return resolved
+
+
+def delete_uploaded_image(
+    stored_path: Optional[str], upload_dir: Path = DEFAULT_UPLOAD_DIR
+) -> tuple[bool, Optional[str]]:
+    """Safely delete an uploaded image file strictly inside upload_dir.
+
+    Returns:
+        (deleted: bool, warning_message: Optional[str])
+        - (False, None): no image path stored or file already absent.
+        - (True, None): image file safely validated and deleted.
+        - (False, msg): path rejected as unsafe or filesystem deletion failed.
+    """
+    if not stored_path or not str(stored_path).strip():
+        return False, None
+
+    safe_path = resolve_safe_upload_path(stored_path, upload_dir=upload_dir)
+    if safe_path is None:
+        return (
+            False,
+            "Skipped image cleanup because the stored image path is outside the allowed uploads directory.",
+        )
+
+    if not safe_path.exists():
+        return False, None
+    if not safe_path.is_file():
+        return False, "Skipped image cleanup because the target path is not a regular file."
+
+    try:
+        safe_path.unlink()
+        return True, None
+    except OSError as exc:
+        return False, f"Could not delete associated image file: {exc}"
