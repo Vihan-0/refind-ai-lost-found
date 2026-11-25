@@ -1,0 +1,372 @@
+/* ReFind AI — Modern SaaS Campus Dashboard Stylesheet
+   Palette:
+     Deep navy:      #111827
+     Primary blue:   #2563EB
+     Light bg:       #F8FAFC
+     White cards:    #FFFFFF
+     Success green:  #16A34A
+     Secondary grey: #64748B
+*/
+
+/* Global typography & spacing polish */
+.stApp {
+    background-color: #F8FAFC;
+    color: #111827;
+}
+
+.block-container {
+    padding-top: 1.75rem;
+    padding-bottom: 3rem;
+    max-width: 1180px;
+}
+
+/* Sidebar refinement */
+section[data-testid="stSidebar"] {
+    background-color: #FFFFFF;
+    border-right: 1px solid #E2E8F0;
+}
+
+section[data-testid="stSidebar"] .stRadio > label {
+    font-weight: 600;
+    color: #475569;
+    font-size: 0.78rem;
+    text-transform: uppercase;
+    letter-spacing: 0.06em;
+}
+
+/* Brand header inside sidebar */
+.brand-box {
+    padding: 0.25rem 0 1rem 0;
+    border-bottom: 1px solid #E2E8F0;
+    margin-bottom: 1rem;
+}
+
+.brand-title {
+    font-size: 1.35rem;
+    font-weight: 700;
+    color: #111827;
+    letter-spacing: -0.02em;
+    margin: 0;
+    display: flex;
+    align-items: center;
+    gap: 0.45rem;
+}
+
+.brand-dot {
+    display: inline-block;
+    width: 10px;
+    height: 10px;
+    border-radius: 999px;
+    background-color: #2563EB;
+}
+
+.brand-tagline {
+    font-size: 0.82rem;
+    color: #64748B;
+    margin: 0.25rem 0 0 0;
+}
+
+/* Page header */
+.page-header {
+    margin-bottom: 1.5rem;
+}
+
+.page-title {
+    font-size: 1.85rem;
+    font-weight: 700;
+    color: #111827;
+    letter-spacing: -0.025em;
+    margin: 0 0 0.25rem 0;
+}
+
+.page-subtitle {
+    font-size: 0.96rem;
+    color: #64748B;
+    margin: 0;
+}
+
+/* KPI Metric Cards */
+.kpi-card {
+    background: #FFFFFF;
+    border: 1px solid #E2E8F0;
+    border-radius: 12px;
+    padding: 1.15rem 1.25rem;
+    box-shadow: 0 1px 3px rgba(15, 23, 42, 0.04);
+    transition: border-color 0.15s ease, box-shadow 0.15s ease;
+}
+
+.kpi-card:hover {
+    border-color: #CBD5E1;
+    box-shadow: 0 4px 12px rgba(15, 23, 42, 0.06);
+}
+
+.kpi-label {
+    font-size: 0.78rem;
+    font-weight: 600;
+    text-transform: uppercase;
+    letter-spacing: 0.05em;
+    color: #64748B;
+    margin-bottom: 0.45rem;
+}
+
+.kpi-value {
+    font-size: 2rem;
+    font-weight: 700;
+    color: #111827;
+    line-height: 1.15;
+    margin-bottom: 0.25rem;
+}
+
+.kpi-value.accent-blue { color: #2563EB; }
+.kpi-value.accent-green { color: #16A34A; }
+.kpi-value.accent-amber { color: #D97706; }
+
+.kpi-caption {
+    font-size: 0.8rem;
+    color: #64748B;
+}
+
+/* Clean Content & Report Cards */
+.rf-card {
+    background: #FFFFFF;
+    border: 1px solid #E2E8F0;
+    border-radius: 12px;
+    padding: 1.2rem 1.35rem;
+    margin-bottom: 0.9rem;
+    box-shadow: 0 1px 2px rgba(15, 23, 42, 0.03);
+}
+
+.rf-card-header {
+    display: flex;
+    justify-content: space-between;
+    align-items: flex-start;
+    gap: 1rem;
+    margin-bottom: 0.55rem;
+}
+
+.rf-card-title {
+    font-size: 1.06rem;
+    font-weight: 650;
+    color: #111827;
+    margin: 0;
+}
+
+.rf-card-desc {
+    font-size: 0.92rem;
+    color: #334155;
+    line-height: 1.55;
+    margin: 0.4rem 0 0.75rem 0;
+}
+
+.rf-meta-row {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 0.55rem 1.1rem;
+    font-size: 0.82rem;
+    color: #64748B;
+}
+
+.rf-meta-item strong {
+    color: #334155;
+    font-weight: 600;
+}
+
+/* Pill badges */
+.rf-badge {
+    display: inline-block;
+    padding: 0.2rem 0.6rem;
+    border-radius: 999px;
+    font-size: 0.75rem;
+    font-weight: 600;
+    letter-spacing: 0.02em;
+    white-space: nowrap;
+}
+
+.badge-lost {
+    background-color: #FEF2F2;
+    color: #B91C1C;
+    border: 1px solid #FECACA;
+}
+
+.badge-found {
+    background-color: #EFF6FF;
+    color: #1D4ED8;
+    border: 1px solid #BFDBFE;
+}
+
+.badge-active {
+    background-color: #F1F5F9;
+    color: #334155;
+    border: 1px solid #CBD5E1;
+}
+
+.badge-recovered {
+    background-color: #F0FDF4;
+    color: #15803D;
+    border: 1px solid #BBF7D0;
+}
+
+/* AI Score badges */
+.badge-strong {
+    background-color: #F0FDF4;
+    color: #15803D;
+    border: 1px solid #86EFAC;
+}
+
+.badge-moderate {
+    background-color: #EFF6FF;
+    color: #1D4ED8;
+    border: 1px solid #93C5FD;
+}
+
+.badge-possible {
+    background-color: #FFFBEB;
+    color: #B45309;
+    border: 1px solid #FDE68A;
+}
+
+.badge-low {
+    background-color: #F1F5F9;
+    color: #475569;
+    border: 1px solid #CBD5E1;
+}
+
+/* AI Match Card & Score Display */
+.match-card {
+    background: #FFFFFF;
+    border: 1px solid #E2E8F0;
+    border-left: 4px solid #2563EB;
+    border-radius: 12px;
+    padding: 1.25rem 1.4rem;
+    margin-bottom: 1rem;
+    box-shadow: 0 2px 6px rgba(15, 23, 42, 0.04);
+}
+
+.match-card.tier-strong {
+    border-left-color: #16A34A;
+}
+
+.match-score-box {
+    text-align: right;
+    min-width: 112px;
+}
+
+.match-score-number {
+    font-size: 1.8rem;
+    font-weight: 750;
+    color: #111827;
+    line-height: 1.05;
+}
+
+.match-score-sub {
+    font-size: 0.72rem;
+    text-transform: uppercase;
+    letter-spacing: 0.05em;
+    color: #64748B;
+    margin-top: 0.15rem;
+}
+
+/* Signal breakdown mini-bars */
+.signal-grid {
+    display: grid;
+    grid-template-columns: repeat(4, minmax(0, 1fr));
+    gap: 0.75rem;
+    margin: 0.85rem 0;
+}
+
+@media (max-width: 768px) {
+    .signal-grid {
+        grid-template-columns: repeat(2, minmax(0, 1fr));
+    }
+}
+
+.signal-box {
+    background: #F8FAFC;
+    border: 1px solid #E2E8F0;
+    border-radius: 8px;
+    padding: 0.55rem 0.75rem;
+}
+
+.signal-label {
+    font-size: 0.72rem;
+    font-weight: 600;
+    color: #64748B;
+    display: flex;
+    justify-content: space-between;
+    margin-bottom: 0.35rem;
+}
+
+.signal-bar-track {
+    width: 100%;
+    height: 6px;
+    background: #E2E8F0;
+    border-radius: 999px;
+    overflow: hidden;
+}
+
+.signal-bar-fill {
+    height: 100%;
+    background: #2563EB;
+    border-radius: 999px;
+}
+
+.signal-bar-fill.green {
+    background: #16A34A;
+}
+
+/* Explainable AI box */
+.xai-box {
+    background: #F8FAFC;
+    border: 1px solid #DBEAFE;
+    border-radius: 8px;
+    padding: 0.75rem 0.95rem;
+    margin-top: 0.65rem;
+    font-size: 0.86rem;
+    color: #1E293B;
+    line-height: 1.5;
+}
+
+.xai-title {
+    font-size: 0.74rem;
+    font-weight: 700;
+    text-transform: uppercase;
+    letter-spacing: 0.05em;
+    color: #2563EB;
+    margin-bottom: 0.25rem;
+}
+
+/* Academic disclaimer banner */
+.academic-note {
+    background: #F1F5F9;
+    border-left: 3px solid #64748B;
+    border-radius: 6px;
+    padding: 0.7rem 0.95rem;
+    font-size: 0.82rem;
+    color: #475569;
+    margin: 0.75rem 0 1.25rem 0;
+}
+
+/* Section headers */
+.section-heading {
+    font-size: 1.12rem;
+    font-weight: 650;
+    color: #111827;
+    margin: 1.25rem 0 0.75rem 0;
+    letter-spacing: -0.01em;
+}
+
+/* Subtle button polish */
+.stButton > button {
+    border-radius: 8px;
+    font-weight: 600;
+}
+
+.stButton > button[kind="primary"] {
+    background-color: #2563EB;
+    border-color: #2563EB;
+}
+
+.stButton > button[kind="primary"]:hover {
+    background-color: #1D4ED8;
+    border-color: #1D4ED8;
+}
